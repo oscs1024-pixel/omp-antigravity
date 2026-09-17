@@ -11,10 +11,6 @@ dist/
 # Local live-probe dumps (may include email/projectId/quota)
 scripts/smoke-all-models-results.json
 scripts/
-*.test.*
-*.spec.*
-test/
-tests/
 *.tgz
 
 # Secrets, credentials, environment files, and local databases

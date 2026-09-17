@@ -11,6 +11,7 @@ import {
   endpointCandidates,
   fetchAvailableRuntimeModel,
   formatRequestDiagnostics,
+  isRetryableEndpointStatus,
   loadCodeAssist,
   parseApiKey,
   resolveProjectId,
@@ -153,7 +154,7 @@ export function streamAntigravity(
             }
             // Only retry across endpoints for 404 (model candidate may exist on another endpoint)
             // or transient server errors (500, 502, 503, 504).
-            if (![404, 500, 502, 503, 504].includes(response.status)) break;
+            if (!isRetryableEndpointStatus(response.status)) break;
           }
 
           if (response?.ok) break;

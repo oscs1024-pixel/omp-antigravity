@@ -9,26 +9,18 @@ import type {
 } from "@oh-my-pi/pi-ai";
 import type { ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
 import {
-  antigravityHeaders,
-  endpointCandidates,
   extractProjectId,
   fetchAvailableModelsCatalog,
   parseApiKey,
+  postAntigravityJson,
   resolveProjectId,
 } from "../client/client.js";
-import {
-  setLastEndpoint,
-  setLastError,
-  setLastProjectId,
-  setLastStatus,
-} from "../diagnostics/diagnostics.js";
+import { setLastError, setLastProjectId } from "../diagnostics/diagnostics.js";
 import { isRecord } from "../utils/util.js";
 import { safeError } from "../utils/security.js";
-import { antigravityFetch } from "../utils/http.js";
 import { PROVIDER_ID } from "../models/models.js";
 import type {
   AccountUsage,
-  ApiErrorBody,
   AvailableModelsRaw,
   LoadCodeAssistRaw,
   ModelQuotaRow,
@@ -72,53 +64,13 @@ function formatReset(resetTime?: string): string {
   return `${mins}m`;
 }
 
-function jsonHeaders(token: string): Record<string, string> {
-  return {
-    ...antigravityHeaders(token),
-    Accept: "application/json",
-  };
-}
-
 async function postJson(
   path: string,
   token: string,
   body: Record<string, unknown>,
   signal?: AbortSignal,
 ): Promise<{ endpoint: string; status: number; data: unknown }> {
-  let lastErrorText = "";
-  for (const endpoint of endpointCandidates()) {
-    try {
-      const res = await antigravityFetch(`${endpoint}${path}`, {
-        method: "POST",
-        headers: jsonHeaders(token),
-        body: JSON.stringify(body),
-        signal,
-      });
-      setLastEndpoint(endpoint);
-      setLastStatus(res.status);
-      const text = await res.text();
-      let data: unknown;
-      try {
-        data = JSON.parse(text) as unknown;
-      } catch {
-        data = { raw: text } satisfies ApiErrorBody;
-      }
-      if (!res.ok) {
-        const errorBody = isRecord(data) ? (data as ApiErrorBody) : undefined;
-        lastErrorText =
-          typeof errorBody?.error?.message === "string" ? errorBody.error.message : text;
-        if (![403, 404, 429, 500, 502, 503, 504].includes(res.status)) {
-          throw new Error(`${path} failed (${String(res.status)}): ${lastErrorText.slice(0, 300)}`);
-        }
-        continue;
-      }
-      return { endpoint, status: res.status, data };
-    } catch (error) {
-      lastErrorText = safeError(error);
-      setLastError(lastErrorText);
-    }
-  }
-  throw new Error(`${path} failed: ${lastErrorText || "no endpoint available"}`);
+  return postAntigravityJson(path, token, body, { signal });
 }
 
 function parseQuotaSummary(data: unknown): { groups: QuotaGroup[]; description?: string } {

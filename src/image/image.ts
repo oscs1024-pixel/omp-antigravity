@@ -4,6 +4,7 @@ import {
   antigravityHeaders,
   defaultProjectId,
   endpointCandidates,
+  isRetryableEndpointStatus,
   jsonOrTextError,
   loadCodeAssist,
   parseApiKey,
@@ -329,7 +330,7 @@ export async function generateAntigravityImage(
         );
         if (!response.ok) {
           lastError = jsonOrTextError(await response.text()).slice(0, 400);
-          if (response.status === 404 || [403, 429, 500, 502, 503, 504].includes(response.status)) {
+          if (isRetryableEndpointStatus(response.status)) {
             continue;
           }
           throw new Error(

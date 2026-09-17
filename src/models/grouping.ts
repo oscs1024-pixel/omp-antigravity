@@ -196,7 +196,7 @@ function mergeAgentSingletons(groups: Map<string, RuntimeGroup>): void {
   }
 }
 
-function parseThinkingSuffix(
+export function parseThinkingSuffix(
   runtimeId: string,
 ): { baseId: string; level: ThinkingLevel } | undefined {
   const lower = runtimeId.toLowerCase();
@@ -270,7 +270,26 @@ function advertisedThinkingLevels(group: RuntimeGroup): Set<string> {
   return levels;
 }
 
-function routingFromVariants(
+/**
+ * Routing table generation with deliberate Availability-First fallback:
+ *
+ * Cost-conscious downward degradation is prioritized:
+ * - `xhigh`  falls back downward: Xhigh -> High -> Medium -> Low -> Minimal
+ * - `high`   falls back downward: High -> Medium -> Low -> Minimal
+ * - `medium` falls back downward: Medium -> Low -> Minimal -> High
+ * - `low`    falls back downward: Low -> Minimal -> Medium -> High
+ * - `minimal` falls back adjacent: Minimal -> Low -> Medium -> High
+ *
+ * Rationale for upward fallback tails (Low -> Minimal -> Medium -> High):
+ * In Google Antigravity, some model families are only provisioned with higher
+ * reasoning tiers on the backend (e.g. `gemini-3.1-pro` only exposed with High thinking / agent runtime).
+ * If a lower-tier request strictly refused to degrade upward when neither Low nor
+ * Minimal variants exist, the model would 404 or fail to route unless the user manually
+ * switched their thinking effort to High. We deliberately prioritize availability
+ * over cost when cheaper variants are absent on the backend, while strictly preferring
+ * cheaper variants whenever they are available.
+ */
+export function routingFromVariants(
   publicId: string,
   variants: Partial<Record<ThinkingLevel, string>>,
   unsuffixed?: string,
@@ -314,8 +333,8 @@ function routingFromVariants(
       medium: pick(
         ThinkingEffort.Medium,
         ThinkingEffort.Low,
-        ThinkingEffort.High,
         ThinkingEffort.Minimal,
+        ThinkingEffort.High,
       ),
       high: pick(
         ThinkingEffort.High,
@@ -328,6 +347,7 @@ function routingFromVariants(
         ThinkingEffort.High,
         ThinkingEffort.Medium,
         ThinkingEffort.Low,
+        ThinkingEffort.Minimal,
       ),
     },
     defaultRequestId,

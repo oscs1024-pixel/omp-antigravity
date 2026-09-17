@@ -82,6 +82,130 @@ export function antigravityHeaders(token: string): Record<string, string> {
   };
 }
 
+export interface PostJsonOptions {
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  headers?: Record<string, string>;
+}
+
+export interface PostJsonResponse<T = unknown> {
+  endpoint: string;
+  status: number;
+  data: T;
+}
+
+export class AntigravityHttpError extends Error {
+  status: number;
+  endpoint: string;
+  data?: unknown;
+
+  constructor(message: string, status: number, endpoint: string, data?: unknown) {
+    super(message);
+    this.name = "AntigravityHttpError";
+    this.status = status;
+    this.endpoint = endpoint;
+    this.data = data;
+  }
+}
+
+/**
+ * Returns true only for HTTP status codes that indicate endpoint-specific
+ * transient errors (404 Not Found, 500 Internal, 502 Bad Gateway, 503 Service
+ * Unavailable, 504 Gateway Timeout).
+ *
+ * Account/auth errors (401, 403) and quota/rate limits (429) are account-level
+ * and MUST NOT be retried across candidate endpoints.
+ */
+export function isRetryableEndpointStatus(status: number): boolean {
+  return status === 404 || status === 500 || status === 502 || status === 503 || status === 504;
+}
+
+/**
+ * Send a single POST JSON request to a specific Antigravity endpoint.
+ */
+export async function postEndpointJson<T = unknown>(
+  endpoint: string,
+  path: string,
+  token: string,
+  body: unknown,
+  options: PostJsonOptions = {},
+): Promise<PostJsonResponse<T>> {
+  const timeout = options.timeoutMs ? AbortSignal.timeout(options.timeoutMs) : undefined;
+  const signal =
+    options.signal && timeout
+      ? AbortSignal.any([options.signal, timeout])
+      : (options.signal ?? timeout);
+
+  const res = await antigravityFetch(`${endpoint}${path}`, {
+    method: "POST",
+    headers: {
+      ...antigravityHeaders(token),
+      Accept: "application/json",
+      ...options.headers,
+    },
+    body: JSON.stringify(body),
+    signal,
+  });
+  setLastEndpoint(endpoint);
+  setLastStatus(res.status);
+
+  const text = await res.text();
+  let data: unknown;
+  try {
+    data = JSON.parse(text) as unknown;
+  } catch {
+    data = { raw: text };
+  }
+
+  if (!res.ok) {
+    const errorBody = isRecord(data) ? (data as { error?: { message?: string } }) : undefined;
+    const message = typeof errorBody?.error?.message === "string" ? errorBody.error.message : text;
+    setLastError(message);
+    throw new AntigravityHttpError(
+      `${path} failed (${String(res.status)}): ${message.slice(0, 300)}`,
+      res.status,
+      endpoint,
+      data,
+    );
+  }
+
+  return { endpoint, status: res.status, data: data as T };
+}
+
+/**
+ * Send a POST JSON request iterating through endpointCandidates() in priority order.
+ * - 2xx: returns immediately.
+ * - 401, 403, 429, or client 4xx: throws immediately (account/quota-level, non-retryable across endpoints).
+ * - 404, 500-504, or network errors: retries on next candidate endpoint.
+ */
+export async function postAntigravityJson<T = unknown>(
+  path: string,
+  token: string,
+  body: unknown,
+  options: PostJsonOptions = {},
+): Promise<PostJsonResponse<T>> {
+  let lastErrorText = "";
+  for (const endpoint of endpointCandidates()) {
+    try {
+      return await postEndpointJson<T>(endpoint, path, token, body, options);
+    } catch (error) {
+      if (options.signal?.aborted) {
+        throw error;
+      }
+      lastErrorText = safeError(error);
+      if (error instanceof AntigravityHttpError) {
+        if (!isRetryableEndpointStatus(error.status)) {
+          throw error;
+        }
+        // Retryable status across endpoints (404, 500, 502, 503, 504) -> try next endpoint
+        continue;
+      }
+      // Network/abort/fetch error without HTTP status -> try next endpoint
+    }
+  }
+  throw new Error(`${path} failed: ${lastErrorText || "no endpoint available"}`);
+}
+
 export function jsonOrTextError(text: string): string {
   try {
     const parsed = JSON.parse(text) as {
@@ -145,23 +269,18 @@ export function extractProjectId(data: unknown): string | undefined {
 }
 
 async function listCloudAICompanionProjects(token: string): Promise<string | undefined> {
-  for (const endpoint of endpointCandidates()) {
-    try {
-      const res = await antigravityFetch(`${endpoint}/v1internal:listCloudAICompanionProjects`, {
-        method: "POST",
-        headers: antigravityHeaders(token),
-        body: JSON.stringify({}),
-        signal: AbortSignal.timeout(DISCOVERY_TIMEOUT_MS),
-      });
-      setLastStatus(res.status);
-      setLastEndpoint(endpoint);
-      if (!res.ok) continue;
-      return extractProjectId(await res.json());
-    } catch (error) {
-      setLastError(safeError(error));
-    }
+  try {
+    const res = await postAntigravityJson(
+      "/v1internal:listCloudAICompanionProjects",
+      token,
+      {},
+      { timeoutMs: DISCOVERY_TIMEOUT_MS },
+    );
+    return extractProjectId(res.data);
+  } catch (error) {
+    setLastError(safeError(error));
+    return undefined;
   }
-  return undefined;
 }
 
 function collectModelLabels(value: unknown, out: string[] = []): string[] {
@@ -204,7 +323,7 @@ function isUsableRuntimeModelId(id: string): boolean {
   return /^(gemini-|claude-|gpt-oss-)/i.test(id) && !/\s/.test(id) && !/^MODEL_/i.test(id);
 }
 
-function buildModelMatchRegex(requestedId: string): RegExp {
+export function buildModelMatchRegex(requestedId: string): RegExp {
   const req = requestedId.toLowerCase();
   // Special alias mappings where runtime ids or display labels differ from their canonical family
   if (req === "gemini-pro-agent") return /gemini[- ]3\.1[- ]pro\s*\(high\)|gemini[- ]pro[- ]agent/i;
@@ -227,7 +346,12 @@ function buildModelMatchRegex(requestedId: string): RegExp {
     const level = levelMatch[1];
     const base = req.slice(0, -(level.length + 1));
     const baseEscaped = escapeRegExp(base).replace(/-/g, "[- ]");
-    const levelPattern = level === "extra-low" ? "(?:extra[- ]low|low)" : level;
+    const levelPattern =
+      level === "extra-low"
+        ? "(?:extra[- ]low|low)"
+        : level === "extra-high"
+          ? "(?:extra[- ]high|high)"
+          : level.replace(/-/g, "[- ]");
     return new RegExp(`${baseEscaped}(?:[- ]${levelPattern}|\\s*\\(${levelPattern}\\))`, "i");
   }
 
@@ -310,7 +434,6 @@ async function fetchAvailableRuntimeModelUncached(
   projectId: string,
   requestedRuntimeModel: string,
 ): Promise<DynamicModelInfo | undefined> {
-  const body = JSON.stringify({ project: projectId });
   const endpoints = endpointCandidates();
   let lastLabels = "";
 
@@ -318,16 +441,13 @@ async function fetchAvailableRuntimeModelUncached(
   // resolves the model, return immediately without waiting on slower sandbox endpoints.
   for (const endpoint of endpoints) {
     try {
-      const res = await antigravityFetch(`${endpoint}/v1internal:fetchAvailableModels`, {
-        method: "POST",
-        headers: antigravityHeaders(token),
-        body,
-        signal: AbortSignal.timeout(DISCOVERY_TIMEOUT_MS),
-      });
-      setLastStatus(res.status);
-      if (!res.ok) continue;
-      setLastEndpoint(endpoint);
-      const data: unknown = await res.json();
+      const { data } = await postEndpointJson(
+        endpoint,
+        "/v1internal:fetchAvailableModels",
+        token,
+        { project: projectId },
+        { timeoutMs: DISCOVERY_TIMEOUT_MS },
+      );
       if (isRecord(data) && isRecord(data.models)) {
         registerDiscoveredModelEnums(data.models as Record<string, { model?: unknown }>);
       }
@@ -340,6 +460,9 @@ async function fetchAvailableRuntimeModelUncached(
       }
     } catch (error) {
       setLastError(safeError(error));
+      if (error instanceof AntigravityHttpError && !isRetryableEndpointStatus(error.status)) {
+        break;
+      }
     }
   }
 
@@ -390,37 +513,16 @@ async function fetchAvailableModelsFromEndpoint(
   signal?: AbortSignal,
 ): Promise<{ endpoint: string; status: number; data: unknown } | undefined> {
   try {
-    const res = await antigravityFetch(`${endpoint}/v1internal:fetchAvailableModels`, {
-      method: "POST",
-      headers: antigravityHeaders(token),
-      body: JSON.stringify({ project: projectId }),
-      signal: catalogSignal(signal),
-    });
-    const text = await res.text();
-    let data: unknown;
-    try {
-      data = JSON.parse(text) as unknown;
-    } catch {
-      data = { raw: text };
-    }
-    if (!res.ok) {
-      const message =
-        isRecord(data) && isRecord(data.error) && typeof data.error.message === "string"
-          ? data.error.message
-          : text;
-      setLastError(message);
-      return undefined;
-    }
-    return { endpoint, status: res.status, data };
-  } catch (error) {
-    setLastError(safeError(error));
+    return await postEndpointJson(
+      endpoint,
+      "/v1internal:fetchAvailableModels",
+      token,
+      { project: projectId },
+      { signal, timeoutMs: DISCOVERY_TIMEOUT_MS },
+    );
+  } catch {
     return undefined;
   }
-}
-
-function catalogSignal(signal?: AbortSignal): AbortSignal {
-  const timeout = AbortSignal.timeout(DISCOVERY_TIMEOUT_MS);
-  return signal ? AbortSignal.any([signal, timeout]) : timeout;
 }
 
 /** Merge catalog payloads from one or more fetchAvailableModels responses. */
@@ -485,31 +587,24 @@ export async function fetchAvailableModelsCatalog(
 }
 
 async function loadCodeAssistUncached(token: string): Promise<string | undefined> {
-  const body = JSON.stringify({
-    metadata: {
-      ideType: "ANTIGRAVITY",
-    },
-  });
-
-  for (const endpoint of endpointCandidates()) {
-    try {
-      const res = await antigravityFetch(`${endpoint}/v1internal:loadCodeAssist`, {
-        method: "POST",
-        headers: antigravityHeaders(token),
-        body,
-        signal: AbortSignal.timeout(DISCOVERY_TIMEOUT_MS),
-      });
-      setLastStatus(res.status);
-      setLastEndpoint(endpoint);
-      if (!res.ok) continue;
-      const project = extractProjectId(await res.json());
-      if (project) return project;
-      return await listCloudAICompanionProjects(token);
-    } catch (error) {
-      setLastError(safeError(error));
-    }
+  try {
+    const res = await postAntigravityJson(
+      "/v1internal:loadCodeAssist",
+      token,
+      {
+        metadata: {
+          ideType: "ANTIGRAVITY",
+        },
+      },
+      { timeoutMs: DISCOVERY_TIMEOUT_MS },
+    );
+    const project = extractProjectId(res.data);
+    if (project) return project;
+    return await listCloudAICompanionProjects(token);
+  } catch (error) {
+    setLastError(safeError(error));
+    return undefined;
   }
-  return undefined;
 }
 
 /** Discover project id with a short in-memory LRU cache keyed by access token. */

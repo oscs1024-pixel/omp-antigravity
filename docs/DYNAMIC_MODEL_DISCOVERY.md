@@ -27,6 +27,14 @@ newly launched model can appear in OMP without a plugin release.
 6. Models present in the conservative static table but missing from an account's live catalog stay
    selectable, which is what keeps a free-tier account working.
 
+### Effort Routing Fallback: Availability over Cost
+
+When constructing model routing tables from discovered variants, Antigravity uses an **Availability-First** fallback hierarchy:
+
+- **Downward cost-conscious fallback**: Higher tiers degrade downward (`high` -> `medium` -> `low` -> `minimal`, and `medium` -> `low` -> `minimal` -> `high`).
+- **Upward availability tail**: Lower tiers (`minimal`, `low`) check downward/adjacent tiers first (`low` -> `minimal`), but if neither exists on the backend (e.g. a model family like `gemini-3.1-pro` only deployed with High thinking / agent runtime), routing degrades upward (`medium` -> `high`).
+- **Rationale**: In Google Antigravity, some architectures are only deployed at higher reasoning tiers. Refusing upward fallback would render the model completely unusable (404 / route error) unless the user manually selected High effort. Preserving model availability is prioritized when cheaper tiers are absent from Google's backend.
+
 ## Acceptance criteria
 
 - **Required:** a fixture containing a previously unknown `gemini-3.9-flash-low|medium|high` family

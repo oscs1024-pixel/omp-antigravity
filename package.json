@@ -32,9 +32,10 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint src",
     "lint:fix": "eslint src --fix",
+    "test": "bun test",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "check": "bun run typecheck && bun run lint && bun run format:check"
+    "check": "bun run typecheck && bun run lint && bun test && bun run format:check"
   },
   "peerDependencies": {
     "@oh-my-pi/pi-ai": ">=18.0.0",
