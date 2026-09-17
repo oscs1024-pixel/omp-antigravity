@@ -139,6 +139,9 @@ export function streamAntigravity(
             setLastStatus(response.status);
             if (response.ok) break;
             lastText = await response.text();
+            if (response.status === 401 || response.status === 403) {
+              break;
+            }
             if (
               response.status === 429 &&
               (/Individual quota reached/i.test(lastText) ||
@@ -148,7 +151,9 @@ export function streamAntigravity(
             ) {
               break;
             }
-            if (![403, 404, 429, 500, 502, 503, 504].includes(response.status)) break;
+            // Only retry across endpoints for 404 (model candidate may exist on another endpoint)
+            // or transient server errors (500, 502, 503, 504).
+            if (![404, 500, 502, 503, 504].includes(response.status)) break;
           }
 
           if (response?.ok) break;

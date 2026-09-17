@@ -24,6 +24,8 @@ const ENDPOINT_FALLBACKS = [
 ];
 
 const PROJECT_CACHE_TTL_MS = 30 * 60 * 1000;
+/** Hard cap on cached (token) project id lookups; oldest entries are dropped first. */
+const PROJECT_CACHE_MAX_ENTRIES = 64;
 const projectCache = new Map<string, { projectId: string | undefined; expiresAt: number }>();
 
 const MODEL_CACHE_TTL_MS = 30 * 60 * 1000;
@@ -204,40 +206,31 @@ function isUsableRuntimeModelId(id: string): boolean {
 
 function buildModelMatchRegex(requestedId: string): RegExp {
   const req = requestedId.toLowerCase();
-  // Display names from fetchAvailableModels (keys are the real runtime ids):
-  //   gemini-3.8-flash-low       → "Gemini 3.8 Flash (Low)"
-  //   gemini-3.8-flash-medium    → "Gemini 3.8 Flash (Medium)"
-  //   gemini-3.8-flash-high      → "Gemini 3.8 Flash (High)"
-  //   gemini-3.7-flash-low       → "Gemini 3.7 Flash (Low)"
-  //   gemini-3.7-flash-medium    → "Gemini 3.7 Flash (Medium)"
-  //   gemini-3.7-flash-high      → "Gemini 3.7 Flash (High)"
-  //   gemini-3.6-flash-low       → "Gemini 3.6 Flash (Low)"
-  //   gemini-3.6-flash-medium    → "Gemini 3.6 Flash (Medium)"
-  //   gemini-3.6-flash-high      → "Gemini 3.6 Flash (High)"
-  //   gemini-3.5-flash-extra-low → "Gemini 3.5 Flash (Low)"
-  //   gemini-3.5-flash-low       → "Gemini 3.5 Flash (Medium)"
-  //   gemini-3-flash-agent       → "Gemini 3.5 Flash (High)"
-  if (req === "gemini-3.8-flash-low") return /gemini[- ]3\.8[- ]flash \(low\)/i;
-  if (req === "gemini-3.8-flash-medium") return /gemini[- ]3\.8[- ]flash \(medium\)/i;
-  if (req === "gemini-3.8-flash-high") return /gemini[- ]3\.8[- ]flash \(high\)/i;
-  if (req === "gemini-3.7-flash-low") return /gemini[- ]3\.7[- ]flash \(low\)/i;
-  if (req === "gemini-3.7-flash-medium") return /gemini[- ]3\.7[- ]flash \(medium\)/i;
-  if (req === "gemini-3.7-flash-high") return /gemini[- ]3\.7[- ]flash \(high\)/i;
-  if (req === "gemini-3.6-flash-low") return /gemini[- ]3\.6[- ]flash \(low\)/i;
-  if (req === "gemini-3.6-flash-medium") return /gemini[- ]3\.6[- ]flash \(medium\)/i;
-  if (req === "gemini-3.6-flash-high") return /gemini[- ]3\.6[- ]flash \(high\)/i;
-  if (req === "gemini-3.5-flash-extra-low") return /gemini[- ]3\.5[- ]flash \(low\)/i;
+  // Special alias mappings where runtime ids or display labels differ from their canonical family
+  if (req === "gemini-pro-agent") return /gemini[- ]3\.1[- ]pro\s*\(high\)|gemini[- ]pro[- ]agent/i;
+  if (req === "gemini-3-flash-agent")
+    return /gemini[- ]3\.5[- ]flash\s*\(high\)|gemini[- ]3[- ]flash[- ]agent/i;
+  if (req === "gemini-3.5-flash-extra-low")
+    return /gemini[- ]3\.5[- ]flash\s*\((?:low|extra[- ]low)\)|gemini[- ]3\.5[- ]flash[- ]extra[- ]low/i;
   if (req === "gemini-3.5-flash-low" || req === "gemini-3.5-flash-medium")
-    return /gemini[- ]3\.5[- ]flash \(medium\)/i;
-  if (req === "gemini-3.5-flash-high" || req === "gemini-3-flash-agent")
-    return /gemini[- ]3\.5[- ]flash \(high\)/i;
+    return /gemini[- ]3\.5[- ]flash\s*\(medium\)|gemini[- ]3\.5[- ]flash[- ](?:low|medium)/i;
+  if (req === "gemini-3.5-flash-high")
+    return /gemini[- ]3\.5[- ]flash\s*\(high\)|gemini[- ]3\.5[- ]flash[- ]high/i;
   if (req.includes("claude-opus-4-6")) return /claude.*opus.*4\.6/i;
   if (req.includes("claude-sonnet-4-6")) return /claude.*sonnet.*4\.6/i;
   if (req.includes("gpt-oss-120b")) return /gpt.*oss.*120b/i;
-  if (req === "gemini-3.1-pro-low") return /gemini[- ]3\.1[- ]pro \(low\)/i;
-  if (req === "gemini-3.1-pro-high" || req === "gemini-pro-agent")
-    return /gemini[- ]3\.1[- ]pro \(high\)/i;
-  const escaped = escapeRegExp(req).replace(/\\-/g, "[- ]");
+
+  // Generic rule: parse (Level) suffix (e.g. -low, -medium, -high, -extra-low) + family name,
+  // matching either runtime id form (gemini-3.9-flash-low) or display name form (Gemini 3.9 Flash (Low)).
+  const levelMatch = req.match(/^(.*)-(low|medium|high|extra-low)$/);
+  if (levelMatch) {
+    const [, base, level] = levelMatch;
+    const baseEscaped = escapeRegExp(base).replace(/-/g, "[- ]");
+    const levelPattern = level === "extra-low" ? "(?:extra[- ]low|low)" : level;
+    return new RegExp(`${baseEscaped}(?:[- ]${levelPattern}|\\s*\\(${levelPattern}\\))`, "i");
+  }
+
+  const escaped = escapeRegExp(req).replace(/-/g, "[- ]");
   return new RegExp(escaped, "i");
 }
 
@@ -521,20 +514,24 @@ async function loadCodeAssistUncached(token: string): Promise<string | undefined
 /** Discover project id with a short in-memory LRU cache keyed by access token. */
 export async function loadCodeAssist(token: string): Promise<string | undefined> {
   const cached = projectCache.get(token);
-  if (cached && cached.expiresAt > Date.now()) {
-    // Refresh LRU order: delete and re-insert so newest is at the end.
+  if (cached) {
+    if (cached.expiresAt > Date.now()) {
+      // Refresh LRU order: delete and re-insert so newest is at the end.
+      projectCache.delete(token);
+      projectCache.set(token, cached);
+      return cached.projectId;
+    }
+    // Expired entry — drop immediately.
     projectCache.delete(token);
-    projectCache.set(token, cached);
-    return cached.projectId;
   }
 
   const projectId = await loadCodeAssistUncached(token);
   projectCache.set(token, { projectId, expiresAt: Date.now() + PROJECT_CACHE_TTL_MS });
 
-  // Evict oldest entry when the cache exceeds 32 entries (O(1) — Map preserves insertion order).
-  if (projectCache.size > 32) {
-    const oldestKey = projectCache.keys().next().value;
-    if (oldestKey !== undefined) projectCache.delete(oldestKey);
+  // Discard oldest entries when exceeding capacity cap.
+  for (const key of projectCache.keys()) {
+    if (projectCache.size <= PROJECT_CACHE_MAX_ENTRIES) break;
+    projectCache.delete(key);
   }
   return projectId;
 }
