@@ -238,28 +238,68 @@ export default function (pi: ExtensionAPI): void {
 
       if (ctx.hasUI) ctx.ui.notify("Checking Antigravity accounts quota…", "info");
 
+      const hasExplicitActive = accounts.some((a) => a.active);
       const lines: string[] = [`Antigravity Accounts (${accounts.length} stored)`];
       const accountRows = await Promise.all(
         accounts.map(async (acc) => {
           const num = `#${acc.position + 1}`;
-          const marker = acc.active ? "* " : "  ";
-          const tag = acc.active ? " [ACTIVE]" : "";
+          const isSelected = acc.active || (!hasExplicitActive && acc.position === 0);
+          const statusDot = isSelected ? "\x1b[32m●\x1b[0m" : " ";
+          const tag = acc.active
+            ? " \x1b[32m[ACTIVE]\x1b[0m"
+            : !hasExplicitActive && acc.position === 0
+              ? " \x1b[32m[ACTIVE (default)]\x1b[0m"
+              : "";
           const emailLabel = acc.email || "(no email)";
           const projLabel = acc.projectId ? ` (project: ${acc.projectId})` : "";
-          const header = `${marker}${num}: ${emailLabel}${projLabel}${tag}`;
+          const header = `  ${statusDot} ${num}: ${emailLabel}${projLabel}${tag}`;
 
           try {
-            const access = await authStorage.getOAuthAccessAt(PROVIDER_ID, acc.position);
-            if (access?.ok && access.accessToken) {
-              const usage = await fetchAccountUsage(
-                JSON.stringify({
-                  token: access.accessToken,
-                  projectId: access.projectId || acc.projectId || "",
-                }),
-              );
-              return `${header}\n     ${formatAccountQuotaSummary(usage)}`;
+            let accessToken: string | undefined;
+            let projectId: string | undefined = acc.projectId;
+
+            // Try reading cached access token from snapshot if still fresh (avoids redundant refresh)
+            if (typeof authStorage.exportSnapshot === "function") {
+              try {
+                const snapshot = authStorage.exportSnapshot();
+                const match = snapshot?.credentials?.find(
+                  (c) => c.id === acc.credentialId && c.provider === PROVIDER_ID,
+                );
+                if (match && match.credential.type === "oauth") {
+                  const cred = match.credential;
+                  if (
+                    typeof cred.access === "string" &&
+                    cred.access &&
+                    typeof cred.expires === "number" &&
+                    Date.now() + 60_000 < cred.expires
+                  ) {
+                    accessToken = cred.access;
+                    if (cred.projectId) projectId = cred.projectId;
+                  }
+                }
+              } catch {
+                // best-effort snapshot inspection
+              }
             }
-            return `${header}\n     Quota: unable to resolve access token (${access && !access.ok ? access.error : "offline"})`;
+
+            if (!accessToken) {
+              const access = await authStorage.getOAuthAccessAt(PROVIDER_ID, acc.position);
+              if (access?.ok && access.accessToken) {
+                accessToken = access.accessToken;
+                if (access.projectId) projectId = access.projectId;
+              } else {
+                const err = access && !access.ok ? access.error : "offline";
+                return `${header}\n     Quota: unable to resolve access token (${err})`;
+              }
+            }
+
+            const usage = await fetchAccountUsage(
+              JSON.stringify({
+                token: accessToken,
+                projectId: projectId || "",
+              }),
+            );
+            return `${header}\n     ${formatAccountQuotaSummary(usage)}`;
           } catch (error) {
             return `${header}\n     Quota: unavailable (${safeError(error).slice(0, 100)})`;
           }
@@ -267,7 +307,24 @@ export default function (pi: ExtensionAPI): void {
       );
       lines.push(...accountRows);
       lines.push("");
-      lines.push("Switch: /antigravity.accounts <number|email> or /session pin <number|email>");
+      lines.push("Switch account:");
+      if (accounts.length > 1) {
+        const targetAcc =
+          accounts.find((a) => (hasExplicitActive ? !a.active : a.position !== 0)) || accounts[1];
+        if (targetAcc) {
+          lines.push(
+            `  /antigravity.accounts ${targetAcc.position + 1}             (switch session to Account #${targetAcc.position + 1})`,
+          );
+        }
+        lines.push(`  /antigravity.accounts 1             (switch session to Account #1)`);
+        const emailPrefix = targetAcc?.email ? targetAcc.email.split("@")[0] : undefined;
+        if (emailPrefix) {
+          lines.push(`  /antigravity.accounts ${emailPrefix}        (switch by email keyword)`);
+        }
+      } else {
+        lines.push("  /antigravity.accounts 1             (pin current session to Account #1)");
+      }
+      lines.push("  /session pin <number|email>         (OMP built-in session pin)");
       emitCommandOutput(ctx, lines.join("\n"));
     },
   });

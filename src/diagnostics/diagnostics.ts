@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { redactSecrets } from "../utils/security.js";
+import { setWithCap } from "../utils/util.js";
 
 export type DiagnosticsSnapshot = {
   status?: number;
@@ -33,11 +34,7 @@ export async function runWithDiagnostics<T>(fn: () => Promise<T>): Promise<T> {
     } finally {
       lastSnapshot = { ...bag };
       if (bag.projectId) {
-        snapshotsByProject.set(bag.projectId, { ...bag });
-        if (snapshotsByProject.size > MAX_PROJECT_SNAPSHOTS) {
-          const oldestKey = snapshotsByProject.keys().next().value;
-          if (oldestKey !== undefined) snapshotsByProject.delete(oldestKey);
-        }
+        setWithCap(snapshotsByProject, bag.projectId, { ...bag }, MAX_PROJECT_SNAPSHOTS);
       }
     }
   });

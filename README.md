@@ -198,7 +198,7 @@ sequenceDiagram
 
 1. **`request.ts` (请求组装与信封)**：
    - 使用 `deriveSignedDecimalFromHash` 派生跨请求一致且稳定的 63 位有符号十进制 `sessionId`。
-   - 从会话上下文提取上一轮助手的 `last_execution_id` 并串联入信封，组装标准 `requestId` (`<trajectoryId>-<reqIndex>`)。
+   - 从会话上下文提取上一轮助手的 `last_execution_id` 并串联入信封，组装标准 `requestId` (`<trajectoryId>-<reqIndex>`)。支持逃生开关 `ANTIGRAVITY_DISABLE_LAST_EXECUTION_ID=1` 紧急旁路。
    - 强制为所有工具调用及 Claude 模型注入 `GeminiToolCallingMode.Validated` 模式，并自动附带 `FORCED_TOOL_DIRECTIVE`。
 2. **`messages.ts` (消息转换)**：将 OMP 多轮消息转为 Gemini Wire 格式，支持多模态图像分块；自动维护 `thoughtSignature` 的连续性与前置用户指令桥接。
 3. **`schema.ts` (Schema 规范转换)**：深度遍历反引用本地与外部 JSON Schema，自动剥离 `$schema`，安全展开为合法的 `GeminiFunctionDeclaration`。
@@ -451,8 +451,8 @@ omp plugin uninstall omp-antigravity
 | 命令                                 | 描述                                                                                                                |
 | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
 | `/login antigravity`                 | 启动 Google OAuth 授权登录流程。                                                                                    |
-| `/antigravity.accounts`              | 列出所有存储的 Antigravity 账号、当前会话锁定状态及各账号实时配额。                                                 |
-| `/antigravity.accounts <1 \| email>` | 为当前会话锁定指定账号（支持序号、邮箱或项目 ID 匹配）。                                                            |
+| `/antigravity.accounts`              | 列出所有存储的 Antigravity 账号、当前会话锁定状态（前置绿色圆点 `●` 与 `[ACTIVE]` 标识）及各账号实时配额。          |
+| `/antigravity.accounts <1 \| email>` | 为当前会话锁定指定账号（支持序号如 `/antigravity.accounts 2`、邮箱关键词如 `oscs1024`）。                           |
 | `/antigravity.usage`                 | 打印当前账号各共享配额池（Gemini / Claude + GPT）的剩余百分比与重置倒计时。                                         |
 | `/antigravity.models`                | 查看当前账号生效的动态运行时模型及各池状态。                                                                        |
 | `/antigravity.models all`            | 包含默认隐藏的内部 Chat / Tab 补全底层模型。                                                                        |
@@ -498,18 +498,19 @@ Antigravity 平台提供跨厂商的多模型支持。插件将各模型折叠�
 
 所有环境变量均支持 `ANTIGRAVITY_` 前缀（兼容量早期版本的 `NOAGY_` 前缀）：
 
-| 环境变量                               | 默认值        | 作用说明                                                                           |
-| -------------------------------------- | ------------- | ---------------------------------------------------------------------------------- |
-| `ANTIGRAVITY_BASE_URL`                 | -             | 覆盖默认 API 基址（必须为合法且受信任的 Google HTTPS 域名）。                      |
-| `ANTIGRAVITY_PROJECT_ID`               | -             | 显式指定 Cloud Code Assist 项目 ID，跳过自动项目发现 round-trip。                  |
-| `ANTIGRAVITY_CALLBACK_HOST`            | `127.0.0.1`   | OAuth 本地监听绑定地址（仅限 `127.0.0.1`、`::1` 或 `localhost`）。                 |
-| `ANTIGRAVITY_RUNTIME_MODEL`            | -             | 强制锁定所有请求至特定的底层 runtime model ID。                                    |
-| `ANTIGRAVITY_CLIENT_ID`                | 官方默认值    | 自定义 Google OAuth 客户端 ID。                                                    |
-| `ANTIGRAVITY_CLIENT_SECRET`            | 官方默认值    | 自定义 Google OAuth 客户端密钥。                                                   |
-| `ANTIGRAVITY_STREAM_HEADER_TIMEOUT_MS` | `180000` (3m) | 响应首包响应头超时阈值（毫秒）；设为 `0` 禁用。                                    |
-| `ANTIGRAVITY_STREAM_STALL_TIMEOUT_MS`  | `120000` (2m) | SSE 传输中途卡顿超时阈值（毫秒）；设为 `0` 禁用。                                  |
-| `ANTIGRAVITY_NO_PREWARM`               | `0`           | 设为 `1` 可跳过插件加载时针对主端点的 TLS 提前连接预热。                           |
-| `ANTIGRAVITY_DEBUG_DUMP`               | `0`           | 设为 `1` 时，请求失败将完整 JSON 请求体写入 `/tmp/antigravity-last-request.json`。 |
+| 环境变量                                | 默认值        | 作用说明                                                                                                                |
+| --------------------------------------- | ------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `ANTIGRAVITY_BASE_URL`                  | -             | 覆盖默认 API 基址（必须为合法且受信任的 Google HTTPS 域名）。                                                           |
+| `ANTIGRAVITY_PROJECT_ID`                | -             | 显式指定 Cloud Code Assist 项目 ID，跳过自动项目发现 round-trip。                                                       |
+| `ANTIGRAVITY_CALLBACK_HOST`             | `127.0.0.1`   | OAuth 本地监听绑定地址（仅限 `127.0.0.1`、`::1` 或 `localhost`）。                                                      |
+| `ANTIGRAVITY_RUNTIME_MODEL`             | -             | 强制锁定所有请求至特定的底层 runtime model ID。                                                                         |
+| `ANTIGRAVITY_CLIENT_ID`                 | 官方默认值    | 自定义 Google OAuth 客户端 ID。                                                                                         |
+| `ANTIGRAVITY_CLIENT_SECRET`             | 官方默认值    | 自定义 Google OAuth 客户端密钥。                                                                                        |
+| `ANTIGRAVITY_STREAM_HEADER_TIMEOUT_MS`  | `180000` (3m) | 响应首包响应头超时阈值（毫秒）；设为 `0` 禁用。                                                                         |
+| `ANTIGRAVITY_STREAM_STALL_TIMEOUT_MS`   | `120000` (2m) | SSE 传输中途卡顿超时阈值（毫秒）；设为 `0` 禁用。                                                                       |
+| `ANTIGRAVITY_NO_PREWARM`                | `0`           | 设为 `1` 可跳过插件加载时针对主端点的 TLS 提前连接预热。                                                                |
+| `ANTIGRAVITY_DEBUG_DUMP`                | `0`           | 设为 `1` 时，请求失败将完整 JSON 请求体写入 `/tmp/antigravity-last-request.json`。                                      |
+| `ANTIGRAVITY_DISABLE_LAST_EXECUTION_ID` | `0`           | 逃生开关：设为 `1` 时禁用向请求 labels 中注入 `last_execution_id`，用于在 Google 服务端多轮轨迹会话出现异常时紧急绕过。 |
 
 ---
 
@@ -535,6 +536,12 @@ Antigravity 平台提供跨厂商的多模型支持。插件将各模型折叠�
 ### 4. 出现两个 Antigravity 登录项
 
 - 一个是 OMP 内置的 `google-antigravity`，另一个是本插件注册的 `antigravity`。二者命名空间相互独立，功能互不干扰，建议选用本插件以获取完整的用量面板与生图支持。
+
+### 5. 多轮会话轨迹串联与 `last_execution_id` 逃生开关
+
+- **运行机制**：Antigravity 服务端在流式响应末尾帧返回 `responseId`。插件会在多轮会话中提取上一轮生成的 ID，作为当前请求 labels 中的 `last_execution_id` 提交给 Google 端点，维持与官方 IDE 客户端完全一致的会话轨迹追踪（Session Trajectory）。
+- **实测验证**：本插件已通过真实多轮上下文实时流式验证，服务端能准确接收并基于前一轮 `responseId` 返回后续轮次。
+- **逃生开关**：如果 Google 后端轨迹链路出现故障或报错特定轨迹错误，可设置环境变量 `ANTIGRAVITY_DISABLE_LAST_EXECUTION_ID=1`（或 `NOAGY_DISABLE_LAST_EXECUTION_ID=1`）临时剥离该标签，此时每轮请求仅依赖常规 messages 上下文运行。
 
 ---
 

@@ -12,6 +12,20 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
 export function asString(value: unknown): string | undefined {
   return typeof value === "string" && value ? value : undefined;
 }
+/**
+ * Sets a key-value pair in a Map, maintaining insertion/recency order and enforcing
+ * a maximum capacity by deleting the oldest entry when size exceeds `max`.
+ */
+export function setWithCap<K, V>(map: Map<K, V>, key: K, value: V, max = 64): void {
+  if (map.has(key)) {
+    map.delete(key);
+  }
+  map.set(key, value);
+  if (map.size > max) {
+    const oldestKey = map.keys().next().value;
+    if (oldestKey !== undefined) map.delete(oldestKey);
+  }
+}
 
 export function sanitizeText(text: unknown): string {
   const value = String(text ?? "");
@@ -149,11 +163,7 @@ export function resolveSessionTrajectory(
         ? deriveSignedDecimalFromHash(rawText)
         : randomSignedDecimalSessionId(),
     };
-    sessionTrajectoryMap.set(seed, entry);
-    if (sessionTrajectoryMap.size > 64) {
-      const oldestKey = sessionTrajectoryMap.keys().next().value;
-      if (oldestKey !== undefined) sessionTrajectoryMap.delete(oldestKey);
-    }
+    setWithCap(sessionTrajectoryMap, seed, entry, 64);
   }
   return entry;
 }

@@ -9,6 +9,7 @@ import type {
 } from "@oh-my-pi/pi-ai";
 import type { ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
 import {
+  AntigravityHttpError,
   extractProjectId,
   fetchAvailableModelsCatalog,
   parseApiKey,
@@ -190,6 +191,7 @@ async function fetchQuotaSummarySafe(
   | {
       ok: false;
       error: string;
+      validationUrl?: string;
     }
 > {
   try {
@@ -198,9 +200,20 @@ async function fetchQuotaSummarySafe(
       result: await postJson("/v1internal:retrieveUserQuotaSummary", token, {}, signal),
     };
   } catch (error) {
+    let validationUrl: string | undefined;
+    if (error instanceof AntigravityHttpError && isRecord(error.data)) {
+      const errObj = error.data as {
+        error?: {
+          details?: Array<{ reason?: string; metadata?: { validation_url?: string } }>;
+        };
+      };
+      validationUrl = errObj.error?.details?.find(
+        (d) => d.reason === "VALIDATION_REQUIRED" && typeof d.metadata?.validation_url === "string",
+      )?.metadata?.validation_url;
+    }
     const msg = safeError(error);
     setLastError(msg);
-    return { ok: false, error: msg };
+    return { ok: false, error: msg, validationUrl };
   }
 }
 
@@ -236,6 +249,7 @@ export async function fetchAccountUsage(
 
   const summary = summaryRes.ok ? summaryRes.result : null;
   const quotaSummaryError = summaryRes.ok ? undefined : summaryRes.error;
+  const validationUrl = summaryRes.ok ? undefined : summaryRes.validationUrl;
   const { groups, description } = summary
     ? parseQuotaSummary(summary.data)
     : { groups: [], description: undefined };
@@ -262,6 +276,7 @@ export async function fetchAccountUsage(
     groups,
     groupDescription: description,
     quotaSummaryError,
+    validationUrl,
     models,
     defaultAgentModelId,
     fetchedAt: Date.now(),
@@ -303,23 +318,70 @@ export function formatUsageSummary(usage: AccountUsage): string {
   return lines.join("\n").trimEnd();
 }
 export function formatAccountQuotaSummary(usage: AccountUsage): string {
+  const quotaParts: string[] = [];
+  const hasMultipleGroups = usage.groups.length > 1;
+  for (const group of usage.groups) {
+    const rawGroup = group.displayName || "";
+    const groupLabel = rawGroup
+      .replace(/\s+models$/i, "")
+      .replace(/\s*(?:and|&)\s+other\b/i, "/Other")
+      .trim();
+    const bucketParts: string[] = [];
+    let hasGenericBucket = false;
+
+    for (const bucket of group.buckets) {
+      const pct = Math.round(bucket.remainingFraction * 100);
+      const reset = bucket.resetTime ? ` (resets ${formatReset(bucket.resetTime)})` : "";
+      if (
+        /^(?:Five Hour|Weekly|Daily)\s+Limit(?:\s+Remaining)?$/i.test(bucket.displayName.trim())
+      ) {
+        hasGenericBucket = true;
+      }
+      const bLabel = bucket.displayName
+        .replace(/^Five Hour Limit Remaining$/i, "5h")
+        .replace(/^Five Hour Limit$/i, "5h")
+        .replace(/^Weekly Limit Remaining$/i, "weekly")
+        .replace(/^Weekly Limit$/i, "weekly")
+        .replace(/\s+Limit Remaining$/i, "")
+        .trim();
+      bucketParts.push(`${bLabel}: ${pct}%${reset}`);
+    }
+    if (!bucketParts.length) continue;
+
+    if ((hasMultipleGroups || hasGenericBucket) && groupLabel && !/quota\s*group/i.test(rawGroup)) {
+      quotaParts.push(`${groupLabel} (${bucketParts.join(", ")})`);
+    } else {
+      quotaParts.push(...bucketParts);
+    }
+  }
+
+  if (!quotaParts.length) {
+    if (
+      usage.validationUrl ||
+      /VALIDATION_REQUIRED|verify your account/i.test(usage.quotaSummaryError || "")
+    ) {
+      quotaParts.push(
+        usage.validationUrl
+          ? `Account verification required: ${usage.validationUrl}`
+          : "Account verification required (Google human verification challenge)",
+      );
+    } else if (
+      usage.quotaSummaryError &&
+      /SUBSCRIPTION_REQUIRED|#3501/i.test(usage.quotaSummaryError)
+    ) {
+      quotaParts.push("Free Tier (quota summary requires paid subscription)");
+    } else if (usage.quotaSummaryError) {
+      quotaParts.push(`Quota: unavailable (${usage.quotaSummaryError.slice(0, 100)})`);
+    } else {
+      quotaParts.push("Quota: available");
+    }
+  }
+
   const parts: string[] = [];
   if (usage.planLabel) {
     parts.push(`[${usage.planLabel}]`);
   }
-  for (const group of usage.groups) {
-    for (const bucket of group.buckets) {
-      const pct = Math.round(bucket.remainingFraction * 100);
-      const reset = bucket.resetTime ? ` (resets ${formatReset(bucket.resetTime)})` : "";
-      parts.push(`${bucket.displayName}: ${pct}%${reset}`);
-    }
-  }
-  if (!parts.length) {
-    if (usage.quotaSummaryError && /SUBSCRIPTION_REQUIRED|#3501/i.test(usage.quotaSummaryError)) {
-      return "Free Tier (quota summary requires paid subscription)";
-    }
-    return "Quota: available";
-  }
+  parts.push(...quotaParts);
   return parts.join(" | ");
 }
 

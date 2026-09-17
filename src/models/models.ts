@@ -2,6 +2,7 @@ import type { ProviderModelConfig } from "@oh-my-pi/pi-coding-agent";
 import type { AntigravityRouting, ThinkingWire } from "../types/types.js";
 import { ThinkingEffort } from "../types/enums.js";
 import type { AntigravityCatalog } from "./grouping.js";
+import { setWithCap } from "../utils/util.js";
 
 export const PROVIDER_ID = "antigravity";
 export const PROVIDER_NAME = "Antigravity";
@@ -380,11 +381,7 @@ export function getAntigravityCatalogForProject(projectId?: string): Antigravity
 
 export function applyAntigravityCatalog(catalog: AntigravityCatalog, projectId?: string): void {
   if (projectId) {
-    catalogsByProject.set(projectId, catalog);
-    if (catalogsByProject.size > MAX_PROJECT_CATALOGS) {
-      const oldestKey = catalogsByProject.keys().next().value;
-      if (oldestKey !== undefined) catalogsByProject.delete(oldestKey);
-    }
+    setWithCap(catalogsByProject, projectId, catalog, MAX_PROJECT_CATALOGS);
   }
   const existingMap = new Map<string, ProviderModelConfig>();
   for (const m of currentModels) existingMap.set(m.id, m);
