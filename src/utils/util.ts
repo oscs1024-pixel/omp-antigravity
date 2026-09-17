@@ -198,7 +198,9 @@ export function antigravityRequestEnvelope(
     used_claude: claudeLabel,
     used_claude_conservative: claudeLabel,
     used_non_gemini_model: nonGeminiLabel,
-    ...(options.lastExecutionId ? { last_execution_id: options.lastExecutionId } : {}),
+    ...(options.lastExecutionId && antigravityEnv("DISABLE_LAST_EXECUTION_ID") !== "1"
+      ? { last_execution_id: options.lastExecutionId }
+      : {}),
   };
 
   const modelEnum = getModelEnum(wireModelId);

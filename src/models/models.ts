@@ -360,6 +360,7 @@ export const ANTIGRAVITY_MODELS: ProviderModelConfig[] = [
 
 let currentModels: ProviderModelConfig[] = ANTIGRAVITY_MODELS;
 let currentRouting: Record<string, AntigravityRouting> = { ...ANTIGRAVITY_ROUTING };
+const MAX_PROJECT_CATALOGS = 64;
 const catalogsByProject = new Map<string, AntigravityCatalog>();
 
 export function getCurrentAntigravityRouting(): Record<string, AntigravityRouting> {
@@ -380,6 +381,10 @@ export function getAntigravityCatalogForProject(projectId?: string): Antigravity
 export function applyAntigravityCatalog(catalog: AntigravityCatalog, projectId?: string): void {
   if (projectId) {
     catalogsByProject.set(projectId, catalog);
+    if (catalogsByProject.size > MAX_PROJECT_CATALOGS) {
+      const oldestKey = catalogsByProject.keys().next().value;
+      if (oldestKey !== undefined) catalogsByProject.delete(oldestKey);
+    }
   }
   const existingMap = new Map<string, ProviderModelConfig>();
   for (const m of currentModels) existingMap.set(m.id, m);

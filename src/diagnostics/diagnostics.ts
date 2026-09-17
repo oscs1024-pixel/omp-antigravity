@@ -17,6 +17,7 @@ const storage = new AsyncLocalStorage<DiagnosticsSnapshot>();
 
 /** Last completed request snapshot for `/antigravity.doctor`. */
 let lastSnapshot: DiagnosticsSnapshot = {};
+const MAX_PROJECT_SNAPSHOTS = 64;
 const snapshotsByProject = new Map<string, DiagnosticsSnapshot>();
 
 function currentBag(): DiagnosticsSnapshot {
@@ -33,6 +34,10 @@ export async function runWithDiagnostics<T>(fn: () => Promise<T>): Promise<T> {
       lastSnapshot = { ...bag };
       if (bag.projectId) {
         snapshotsByProject.set(bag.projectId, { ...bag });
+        if (snapshotsByProject.size > MAX_PROJECT_SNAPSHOTS) {
+          const oldestKey = snapshotsByProject.keys().next().value;
+          if (oldestKey !== undefined) snapshotsByProject.delete(oldestKey);
+        }
       }
     }
   });

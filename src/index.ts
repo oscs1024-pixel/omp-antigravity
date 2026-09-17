@@ -1,3 +1,4 @@
+import type { AuthStorage } from "@oh-my-pi/pi-ai";
 import type { ExtensionCommandContext, ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { getApiKey, loginAntigravity, refreshAntigravityToken } from "./auth/index.js";
 import { DEFAULT_ENDPOINT, endpointCandidates, parseApiKey } from "./client/index.js";
@@ -43,35 +44,11 @@ function emitCommandOutput(
     ctx.ui.notify(text, type);
     return;
   }
-  process.stdout.write(`${text}\n`);
-}
-interface HostAuthAccount {
-  position: number;
-  credentialId: number;
-  email?: string;
-  orgName?: string;
-  accountId?: string;
-  projectId?: string;
-  active: boolean;
-}
-
-interface HostAuthStorage {
-  listOAuthAccounts(provider: string, sessionId?: string): HostAuthAccount[];
-  pinSessionOAuthAccount(provider: string, sessionId: string, credentialId: number): boolean;
-  getOAuthAccessAt(
-    provider: string,
-    position: number,
-  ): Promise<{ token: string; projectId?: string; email?: string } | undefined>;
-}
-
-function getHostAuthStorage(registry: unknown): HostAuthStorage | undefined {
-  if (isRecord(registry) && "authStorage" in registry && isRecord(registry.authStorage)) {
-    const storage = registry.authStorage;
-    if ("listOAuthAccounts" in storage && typeof storage.listOAuthAccounts === "function") {
-      return storage as unknown as HostAuthStorage;
-    }
+  if (type === "warning" || type === "error") {
+    console.error(text);
+  } else {
+    console.log(text);
   }
-  return undefined;
 }
 
 async function withUsage(
@@ -182,23 +159,22 @@ export default function (pi: ExtensionAPI): void {
       "List stored Antigravity accounts with quota or pin session to an account (usage: /antigravity.accounts [<number|email>])",
     handler: async (args, ctx) => {
       const sessionId = ctx.sessionManager?.getSessionId?.();
-      const authStorage = getHostAuthStorage(ctx.modelRegistry);
+      const authStorage: AuthStorage | undefined = ctx.modelRegistry.authStorage;
 
       if (!authStorage || typeof authStorage.listOAuthAccounts !== "function") {
         const apiKey = await resolveApiKeyFromContext(ctx);
-        const currentEmail = "default";
-        let currentProj = "unknown";
+        let projectInfo = "";
         if (apiKey) {
           try {
             const parsed = parseApiKey(apiKey);
-            currentProj = parsed.projectId || currentProj;
+            if (parsed.projectId) projectInfo = ` (project: ${parsed.projectId})`;
           } catch {
             // bare token
           }
         }
         emitCommandOutput(
           ctx,
-          `Antigravity accounts:\nActive session account: ${currentEmail} (project: ${currentProj})\n(Host multi-account storage inspection is unavailable in this environment; use /session pin)`,
+          `Antigravity accounts:\nActive session credentials: configured${projectInfo}\n(Host multi-account storage inspection is unavailable in this environment; use /session pin)`,
         );
         return;
       }
@@ -218,11 +194,23 @@ export default function (pi: ExtensionAPI): void {
         let match = accounts.find((acc) => String(acc.position + 1) === targetArg);
         if (!match) {
           const lower = targetArg.toLowerCase();
-          match = accounts.find(
+          const matches = accounts.filter(
             (acc) =>
               acc.email?.toLowerCase().includes(lower) ||
               acc.projectId?.toLowerCase().includes(lower),
           );
+          if (matches.length > 1) {
+            emitCommandOutput(
+              ctx,
+              `Multiple accounts match "${targetArg}". Please specify by number:\n` +
+                matches
+                  .map((a) => `  #${a.position + 1}: ${a.email || a.projectId || "account"}`)
+                  .join("\n"),
+              "warning",
+            );
+            return;
+          }
+          match = matches[0];
         }
         if (!match) {
           emitCommandOutput(
@@ -251,32 +239,33 @@ export default function (pi: ExtensionAPI): void {
       if (ctx.hasUI) ctx.ui.notify("Checking Antigravity accounts quota…", "info");
 
       const lines: string[] = [`Antigravity Accounts (${accounts.length} stored)`];
-      for (const acc of accounts) {
-        const num = `#${acc.position + 1}`;
-        const marker = acc.active ? "* " : "  ";
-        const tag = acc.active ? " [ACTIVE]" : "";
-        const emailLabel = acc.email || "(no email)";
-        const projLabel = acc.projectId ? ` (project: ${acc.projectId})` : "";
-        lines.push(`${marker}${num}: ${emailLabel}${projLabel}${tag}`);
+      const accountRows = await Promise.all(
+        accounts.map(async (acc) => {
+          const num = `#${acc.position + 1}`;
+          const marker = acc.active ? "* " : "  ";
+          const tag = acc.active ? " [ACTIVE]" : "";
+          const emailLabel = acc.email || "(no email)";
+          const projLabel = acc.projectId ? ` (project: ${acc.projectId})` : "";
+          const header = `${marker}${num}: ${emailLabel}${projLabel}${tag}`;
 
-        try {
-          const access = await authStorage.getOAuthAccessAt(PROVIDER_ID, acc.position);
-          if (access?.token) {
-            const usage = await fetchAccountUsage(
-              JSON.stringify({
-                token: access.token,
-                projectId: access.projectId || acc.projectId || "",
-              }),
-            );
-            lines.push(`     ${formatAccountQuotaSummary(usage)}`);
-          } else {
-            lines.push("     Quota: unable to resolve access token");
+          try {
+            const access = await authStorage.getOAuthAccessAt(PROVIDER_ID, acc.position);
+            if (access?.ok && access.accessToken) {
+              const usage = await fetchAccountUsage(
+                JSON.stringify({
+                  token: access.accessToken,
+                  projectId: access.projectId || acc.projectId || "",
+                }),
+              );
+              return `${header}\n     ${formatAccountQuotaSummary(usage)}`;
+            }
+            return `${header}\n     Quota: unable to resolve access token (${access && !access.ok ? access.error : "offline"})`;
+          } catch (error) {
+            return `${header}\n     Quota: unavailable (${safeError(error).slice(0, 100)})`;
           }
-        } catch (error) {
-          lines.push(`     Quota: unavailable (${safeError(error).slice(0, 100)})`);
-        }
-      }
-
+        }),
+      );
+      lines.push(...accountRows);
       lines.push("");
       lines.push("Switch: /antigravity.accounts <number|email> or /session pin <number|email>");
       emitCommandOutput(ctx, lines.join("\n"));
