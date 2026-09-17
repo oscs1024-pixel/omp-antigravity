@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { createServer, type Server } from "node:http";
-import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
+import type { OAuthCredentials, OAuthLoginCallbacks } from "@oh-my-pi/pi-ai";
 import { defaultProjectId, loadCodeAssist } from "../client/client.js";
 import { escapeHtml, antigravityEnv } from "../utils/util.js";
 import { resolveCallbackHost, redactSecrets } from "../utils/security.js";
@@ -148,7 +148,9 @@ function startCallbackServer(expectedState: string): Promise<CallbackServer> {
       }
 
       res.writeHead(200, oauthCallbackHeaders());
-      res.end("Antigravity authentication complete. You can close this window and return to Pi.");
+      res.end(
+        "Antigravity authentication complete. You can close this window and return to Oh My Pi.",
+      );
       finish(() => resolveCode({ code, state }));
     });
 
@@ -339,7 +341,7 @@ export async function loginAntigravity(
     callbacks.onAuth({
       url: `${AUTH_URL}?${authParams.toString()}`,
       instructions:
-        "Complete Google sign-in. Pi captures the local callback automatically — or, on a remote/headless machine, paste the callback URL when prompted.",
+        "Complete Google sign-in. Oh My Pi captures the local callback automatically — or, on a remote/headless machine, paste the callback URL when prompted.",
     });
 
     const { code, state: returnedState } = await acquireAuthCode(state, {
@@ -439,4 +441,4 @@ export function getApiKey(credentials: OAuthCredentials): string {
   });
 }
 
-export type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
+export type { OAuthCredentials, OAuthLoginCallbacks } from "@oh-my-pi/pi-ai";

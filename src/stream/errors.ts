@@ -1,0 +1,109 @@
+import { jsonOrTextError } from "../client/client.js";
+import { StopReason } from "../types/enums.js";
+import { redactSecrets } from "../utils/security.js";
+
+/** Exported for unit tests. */
+export function mapStopReason(reason: string | undefined): StopReason {
+  if (reason === "STOP") return StopReason.Stop;
+  if (reason === "MAX_TOKENS") return StopReason.Length;
+  return reason ? StopReason.Error : StopReason.Stop;
+}
+
+/** Exported for unit tests. */
+export function friendlyAntigravityError(status: number | undefined, text: string): string {
+  const msg = redactSecrets(jsonOrTextError(text)).slice(0, 500);
+  if (status === 400) {
+    if (/Requests ending with a model turn are not supported/i.test(msg)) {
+      return "Antigravity rejected an invalid conversation message boundary. Next: update the extension or add a user message / start a new session, then retry.";
+    }
+    if (
+      /function call turn comes immediately after a user turn or after a function response turn/i.test(
+        msg,
+      )
+    ) {
+      return "Antigravity rejected an invalid function-call message boundary. Next: update the extension or start a new session, then retry; re-login is not required.";
+    }
+    if (/API key not valid|API_KEY_INVALID/i.test(msg)) {
+      return "Antigravity login expired or credentials are invalid. Next: run /login antigravity, then retry.";
+    }
+    if (/Invalid JSON payload|Unknown name/i.test(msg)) {
+      return `Antigravity request format was rejected by the backend (${msg}). Next: switch to a simpler model or retry after updating the extension.`;
+    }
+    if (/Request contains an invalid argument/i.test(msg)) {
+      return `Antigravity rejected this request (${msg}). Next: retry once; if it keeps failing, switch models or re-login.`;
+    }
+    return `Bad request from Antigravity. Next: retry once, then run /login antigravity if it keeps failing. Backend said: ${msg}`;
+  }
+  if (status === 401) {
+    return "Antigravity authentication failed. Next: run /login antigravity, then retry.";
+  }
+  if (status === 403) {
+    if (text.includes("VALIDATION_REQUIRED")) {
+      const start = text.indexOf("{");
+      if (start !== -1) {
+        try {
+          const parsed = JSON.parse(text.slice(start)) as {
+            error?: {
+              details?: Array<{ reason?: string; metadata?: { validation_url?: string } }>;
+            };
+          };
+          const validationUrl = parsed.error?.details?.find(
+            (d) =>
+              d.reason === "VALIDATION_REQUIRED" && typeof d.metadata?.validation_url === "string",
+          )?.metadata?.validation_url;
+          if (validationUrl) {
+            return `Account verification required. Visit ${validationUrl} to continue, then retry your request.`;
+          }
+        } catch {
+          // not JSON
+        }
+      }
+    }
+    if (/permission|forbidden|access/i.test(msg)) {
+      return "Antigravity access was denied for this account or project. Next: try another model, re-login, or use an account with access.";
+    }
+    return `Antigravity denied this request. Next: re-login or try another model. Backend said: ${msg}`;
+  }
+  if (status === 404) {
+    if (/Requested entity was not found/i.test(msg)) {
+      return "This model is not available right now. Next: switch to gemini-3.8-flash, gemini-3.7-flash, gemini-3.6-flash, gemini-3.5-flash, gemini-3.1-pro, or another working model.";
+    }
+    return `Antigravity could not find the requested resource. Next: retry or switch models. Backend said: ${msg}`;
+  }
+  if (status === 408) return "Antigravity timed out. Next: retry the same request.";
+  if (status === 409) {
+    return "Antigravity reported a conflict for this request. Next: retry once or start a new chat session.";
+  }
+  if (status === 429) {
+    const wait = msg.match(/Resets? in ([^.\n]+)/i)?.[1]?.trim();
+    if (/Individual quota reached/i.test(msg)) {
+      return `Quota reached. Please wait ${wait || "for reset"}. Next: switch models or try again after reset.`;
+    }
+    // Google answers a real quota wall with a "Resets in …" hint, but uses generic
+    // RESOURCE_EXHAUSTED ("Resource has been exhausted (e.g. check quota).") for
+    // transient throttling and capacity pressure. Classifying on the word "quota"
+    // alone wrongly marked transient throttling as a hard quota wall, disabling
+    // OMP's automatic retry backoff. Keep real quota walls non-retryable, and
+    // format transient throttling so OMP's retry mechanism engages.
+    const hardLimit =
+      Boolean(wait) ||
+      (!/rate.?limit/i.test(msg) &&
+        /quota exceeded|exceeded your|limit reached|reached your|daily limit/i.test(msg));
+    if (hardLimit) {
+      return `Quota reached.${wait ? ` Please wait ${wait}.` : ""} Next: switch models or retry later.`;
+    }
+    return "Rate limited by Antigravity (429 ResourceExhausted). Next: retrying automatically; if it persists, switch models.";
+  }
+  if (status === 500) {
+    return "Antigravity had an internal server error. Next: retry in a moment or switch models.";
+  }
+  if (status === 502) return "Antigravity returned a bad gateway error. Next: retry in a moment.";
+  if (status === 503) {
+    if (/No capacity available/i.test(msg)) {
+      return "This model has no capacity right now. Next: retry later or switch to another model.";
+    }
+    return "Antigravity is temporarily unavailable. Next: retry in a moment or switch models.";
+  }
+  if (status === 504) return "Antigravity timed out upstream. Next: retry in a moment.";
+  return msg;
+}

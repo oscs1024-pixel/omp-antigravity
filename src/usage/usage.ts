@@ -1,4 +1,13 @@
-import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type {
+  UsageAmount,
+  UsageCredential,
+  UsageLimit,
+  UsageProvider,
+  UsageReport,
+  UsageStatus,
+  UsageWindow,
+} from "@oh-my-pi/pi-ai";
+import type { ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
 import {
   antigravityHeaders,
   endpointCandidates,
@@ -16,6 +25,7 @@ import {
 import { isRecord } from "../utils/util.js";
 import { safeError } from "../utils/security.js";
 import { antigravityFetch } from "../utils/http.js";
+import { PROVIDER_ID } from "../models/models.js";
 import type {
   AccountUsage,
   ApiErrorBody,
@@ -73,6 +83,7 @@ async function postJson(
   path: string,
   token: string,
   body: Record<string, unknown>,
+  signal?: AbortSignal,
 ): Promise<{ endpoint: string; status: number; data: unknown }> {
   let lastErrorText = "";
   for (const endpoint of endpointCandidates()) {
@@ -81,6 +92,7 @@ async function postJson(
         method: "POST",
         headers: jsonHeaders(token),
         body: JSON.stringify(body),
+        signal,
       });
       setLastEndpoint(endpoint);
       setLastStatus(res.status);
@@ -194,15 +206,20 @@ function parseTier(value: unknown): TierInfo | undefined {
   };
 }
 
-async function loadCodeAssistSafe(token: string) {
+async function loadCodeAssistSafe(token: string, signal?: AbortSignal) {
   try {
-    return await postJson("/v1internal:loadCodeAssist", token, {
-      metadata: {
-        ideType: "ANTIGRAVITY",
-        platform: "PLATFORM_UNSPECIFIED",
-        pluginType: "GEMINI",
+    return await postJson(
+      "/v1internal:loadCodeAssist",
+      token,
+      {
+        metadata: {
+          ideType: "ANTIGRAVITY",
+          platform: "PLATFORM_UNSPECIFIED",
+          pluginType: "GEMINI",
+        },
       },
-    });
+      signal,
+    );
   } catch {
     return null;
   }
@@ -213,7 +230,10 @@ async function loadCodeAssistSafe(token: string) {
  * accounts get 403 SUBSCRIPTION_REQUIRED (#3501). It is best-effort diagnostics
  * only — never let it block the rest of the account data (models, tier, project).
  */
-async function fetchQuotaSummarySafe(token: string): Promise<
+async function fetchQuotaSummarySafe(
+  token: string,
+  signal?: AbortSignal,
+): Promise<
   | { ok: true; result: { endpoint: string; status: number; data: unknown } }
   | {
       ok: false;
@@ -221,7 +241,10 @@ async function fetchQuotaSummarySafe(token: string): Promise<
     }
 > {
   try {
-    return { ok: true, result: await postJson("/v1internal:retrieveUserQuotaSummary", token, {}) };
+    return {
+      ok: true,
+      result: await postJson("/v1internal:retrieveUserQuotaSummary", token, {}, signal),
+    };
   } catch (error) {
     const msg = safeError(error);
     setLastError(msg);
@@ -229,7 +252,11 @@ async function fetchQuotaSummarySafe(token: string): Promise<
   }
 }
 
-export async function fetchAccountUsage(apiKeyRaw?: string): Promise<AccountUsage> {
+export async function fetchAccountUsage(
+  apiKeyRaw?: string,
+  options?: { signal?: AbortSignal },
+): Promise<AccountUsage> {
+  const signal = options?.signal;
   const creds = parseApiKey(apiKeyRaw);
   const initialProjectId =
     creds.projectId ||
@@ -241,9 +268,9 @@ export async function fetchAccountUsage(apiKeyRaw?: string): Promise<AccountUsag
   // Fetch loadCodeAssist, quota summary, and available models all in parallel
   // to minimize command execution latency.
   const [assistResult, summaryRes, available] = await Promise.all([
-    loadCodeAssistSafe(creds.token),
-    fetchQuotaSummarySafe(creds.token),
-    fetchAvailableModelsCatalog(creds.token, initialProjectId),
+    loadCodeAssistSafe(creds.token, signal),
+    fetchQuotaSummarySafe(creds.token, signal),
+    fetchAvailableModelsCatalog(creds.token, initialProjectId, signal),
   ]);
 
   // Derive project ID from the loadCodeAssist response or stored project ID.
@@ -360,11 +387,156 @@ export function formatModelsList(usage: AccountUsage, opts?: { all?: boolean }):
   return lines.join("\n");
 }
 
+const HOUR_MS = 60 * 60 * 1000;
+
+/**
+ * Classify a quota bucket's window the way OMP's own Antigravity usage provider
+ * does, so the normalized report renders with native window labels instead of
+ * raw backend strings.
+ */
+function classifyWindow(
+  id: string | undefined,
+  label: string | undefined,
+): UsageWindow | undefined {
+  const source = `${id ?? ""} ${label ?? ""}`.toLowerCase();
+  if (source.includes("week") || source.includes("7d") || /7[\s_-]*day/.test(source)) {
+    return { id: "weekly", label: "Weekly", durationMs: 7 * 24 * HOUR_MS };
+  }
+  if (source.includes("5h") || source.includes("five hour") || /5[\s_-]*hour/.test(source)) {
+    return { id: "5h", label: "5 Hour", durationMs: 5 * HOUR_MS };
+  }
+  if (source.includes("day") || source.includes("daily") || source.includes("24h")) {
+    return { id: "daily", label: "Daily", durationMs: 24 * HOUR_MS };
+  }
+  if (id || label) return { id: id ?? label ?? "default", label: label ?? id ?? "Default" };
+  return undefined;
+}
+
+function usageStatus(remainingFraction: number | undefined): UsageStatus {
+  if (remainingFraction === undefined) return "unknown";
+  if (remainingFraction <= 0) return "exhausted";
+  if (remainingFraction <= 0.1) return "warning";
+  return "ok";
+}
+
+/**
+ * Map this provider's account usage onto OMP's normalized usage report, so OMP's
+ * own usage surfaces can show Antigravity quota rather than only the plugin's
+ * `/antigravity.usage` command.
+ *
+ * One limit is emitted per shared quota bucket. Per-model rows are deliberately
+ * only summarized in `metadata`: they repeat the same shared pool figures, so
+ * emitting one limit per model would fill the usage UI with duplicates.
+ */
+export function buildUsageReport(usage: AccountUsage): UsageReport {
+  const shared = usage.groups.length > 1 || usage.groups.some((group) => group.buckets.length > 1);
+  const limits: UsageLimit[] = [];
+
+  for (const group of usage.groups) {
+    for (const bucket of group.buckets) {
+      const window = classifyWindow(bucket.window, bucket.displayName);
+      const resetsAt = bucket.resetTime ? Date.parse(bucket.resetTime) : undefined;
+      const hasResetsAt = Number.isFinite(resetsAt);
+      const amount: UsageAmount = {
+        unit: "percent",
+        remainingFraction: bucket.remainingFraction,
+      };
+      limits.push({
+        id: `${PROVIDER_ID}:${group.displayName}:${bucket.bucketId}`,
+        label: bucket.displayName,
+        scope: {
+          provider: PROVIDER_ID,
+          projectId: usage.projectId,
+          ...(usage.email ? { accountId: usage.email } : {}),
+          ...(usage.planLabel ? { tier: usage.planLabel } : {}),
+          windowId: window?.id ?? bucket.bucketId,
+          ...(shared ? { shared: true, sharedGroup: group.displayName } : {}),
+        },
+        ...(window || hasResetsAt
+          ? {
+              window: {
+                ...(window ?? { id: bucket.bucketId, label: bucket.displayName }),
+                ...(hasResetsAt ? { resetsAt } : {}),
+              },
+            }
+          : {}),
+        amount,
+        status: usageStatus(bucket.remainingFraction),
+      });
+    }
+  }
+
+  const notes: string[] = [];
+  if (usage.groupDescription) notes.push(usage.groupDescription);
+  notes.push("Remaining percent reflects a shared pool, not a private per-model budget.");
+  if (usage.quotaSummaryError) notes.push(quotaErrorNote(usage.quotaSummaryError));
+
+  return {
+    provider: PROVIDER_ID,
+    fetchedAt: usage.fetchedAt,
+    limits,
+    notes,
+    metadata: {
+      endpoint: usage.endpoint,
+      projectId: usage.projectId,
+      plan: usage.planLabel ?? null,
+      modelCount: usage.models.length,
+      defaultAgentModelId: usage.defaultAgentModelId ?? null,
+    },
+  };
+}
+
+/**
+ * OMP may hand a usage fetcher either the OAuth access token or the provider's
+ * own API-key string, so accept both forms. The bare token is what
+ * `AuthStorage` exposes for OAuth providers.
+ */
+function usageCredentialToken(credential: UsageCredential): string | undefined {
+  if (typeof credential.accessToken === "string" && credential.accessToken) {
+    return credential.accessToken;
+  }
+  if (typeof credential.apiKey === "string" && credential.apiKey) {
+    try {
+      return parseApiKey(credential.apiKey).token;
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Normalized usage provider registered on the `ProviderConfig`.
+ *
+ * `validatesCredentials` is deliberately left unset: the aggregate quota-summary
+ * RPC is gated behind a paid subscription, so a free-tier 403 is expected and
+ * must not be read as a broken credential.
+ */
+export const antigravityUsageProvider: UsageProvider = {
+  id: PROVIDER_ID,
+  async fetchUsage(params): Promise<UsageReport | null> {
+    const token = usageCredentialToken(params.credential);
+    if (!token) return null;
+    try {
+      const usage = await fetchAccountUsage(
+        JSON.stringify({ token, projectId: params.credential.projectId ?? "" }),
+        { signal: params.signal },
+      );
+      return buildUsageReport(usage);
+    } catch (error) {
+      // Returning null (instead of throwing) keeps OMP's last-good report and
+      // records the reason for /antigravity.doctor.
+      setLastError(safeError(error));
+      return null;
+    }
+  },
+};
+
 export async function resolveApiKeyFromContext(
   ctx: ExtensionCommandContext,
 ): Promise<string | undefined> {
   try {
-    return await ctx.modelRegistry.getApiKeyForProvider("antigravity");
+    return await ctx.modelRegistry.getApiKeyForProvider(PROVIDER_ID);
   } catch {
     return undefined;
   }

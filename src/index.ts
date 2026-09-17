@@ -1,14 +1,14 @@
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { StringEnum, Type } from "@earendil-works/pi-ai";
-import { registerApiProvider } from "@earendil-works/pi-ai/compat";
+import type { ExtensionCommandContext, ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { getApiKey, loginAntigravity, refreshAntigravityToken } from "./auth/index.js";
 import { DEFAULT_ENDPOINT, endpointCandidates } from "./client/index.js";
 import { getLastDiagnostics, runWithDiagnostics } from "./diagnostics/index.js";
 import {
+  DEFAULT_IMAGE_DIR,
   DEFAULT_IMAGE_MODEL,
   generateAntigravityImage,
   IMAGE_ASPECT_RATIOS,
   parseImageCommandArgs,
+  type ImageCommandArgs,
 } from "./image/index.js";
 import {
   applyAntigravityCatalog,
@@ -16,21 +16,21 @@ import {
   getCurrentAntigravityCatalog,
   PROVIDER_ID,
   PROVIDER_NAME,
-  refreshAntigravityModels,
   resolvedCatalog,
 } from "./models/index.js";
 import { ANTIGRAVITY_API, streamAntigravity } from "./stream/index.js";
 import {
+  antigravityUsageProvider,
   fetchAccountUsage,
   formatModelsList,
   formatUsageSummary,
   resolveApiKeyFromContext,
 } from "./usage/index.js";
-import { prewarmConnection, redactSecrets } from "./utils/index.js";
+import { isRecord, prewarmConnection, redactSecrets } from "./utils/index.js";
 
 /**
- * Pi's interactive `notify` writes into the chat transcript. `console.log` in that
- * mode prints to the raw terminal and paints over the TUI. Use one channel only.
+ * OMP's interactive `ui.notify` writes into the chat transcript. `console.log` in
+ * that mode prints to the raw terminal and paints over the TUI. Use one channel only.
  */
 function emitCommandOutput(
   ctx: ExtensionCommandContext,
@@ -64,37 +64,86 @@ async function withUsage(
     emitCommandOutput(ctx, fn(usage));
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
-    emitCommandOutput(ctx, `Antigravity usage failed: ${msg}`, "warning");
+    emitCommandOutput(ctx, `Antigravity usage failed: ${redactSecrets(msg)}`, "warning");
   }
 }
 
+/**
+ * Narrow the `generate_antigravity_image` tool arguments from `unknown`.
+ *
+ * OMP's injected `pi.zod` builder produces an omptype `ZodLikeSchema`, which
+ * satisfies pi-ai's `TJsonSchema` branch rather than its `Type` branch — so
+ * `Static<TParams>` collapses to `unknown` for every `z.object(...)` tool schema.
+ * OMP's own bundled example (`examples/extensions/hello.ts`) hits the identical
+ * gap, so this is an upstream typing limitation, not a mistake in the schema.
+ *
+ * The schema passed as `parameters` is still what OMP validates tool arguments
+ * against before dispatch. This helper only restores a concrete shape for the
+ * handler, and deliberately coerces rather than asserts: the real semantic
+ * validation (prompt length, model id, aspect ratio, path containment) lives in
+ * `generateAntigravityImage`, which rejects empty or unsafe values with a
+ * user-facing error.
+ */
+function readGenerateImageParams(value: unknown): ImageCommandArgs {
+  const record = isRecord(value) ? value : {};
+  return {
+    prompt: typeof record.prompt === "string" ? record.prompt : "",
+    aspectRatio: typeof record.aspectRatio === "string" ? record.aspectRatio : undefined,
+    model: typeof record.model === "string" ? record.model : undefined,
+    path: typeof record.path === "string" ? record.path : undefined,
+  };
+}
+
 export default function (pi: ExtensionAPI): void {
+  pi.setLabel("Antigravity");
+
   // Open the TLS connection up front so the first message of a session does not pay
   // the handshake. Opt out with ANTIGRAVITY_NO_PREWARM=1.
   const primaryEndpoint = endpointCandidates()[0];
   if (primaryEndpoint) prewarmConnection(primaryEndpoint);
 
-  registerApiProvider({
-    api: ANTIGRAVITY_API,
-    stream: streamAntigravity,
-    streamSimple: streamAntigravity,
-  });
+  // OMP injects a Zod-compatible schema builder; the docs recommend it over the
+  // legacy TypeBox `Type` helper for new tool schemas.
+  const z = pi.zod;
 
   const initialCatalog = getCurrentAntigravityCatalog();
 
   pi.registerProvider(PROVIDER_ID, {
-    name: PROVIDER_NAME,
+    // `ProviderConfig` has no `name` field — the display name OMP shows comes from
+    // `oauth.name` below and from each model's `name`.
     baseUrl: DEFAULT_ENDPOINT,
+    // OMP: a custom `api` id is registered together with `streamSimple` below.
     api: ANTIGRAVITY_API,
+    // Static catalog stays as an offline/cold-start fallback alongside the
+    // live discovery result from fetchDynamicModels.
     models: initialCatalog.models,
-    refreshModels: refreshAntigravityModels,
+    // OMP-native streaming: Cloud Code Assist is not OpenAI-compatible, so all
+    // requests go through the native streamSimple implementation.
+    streamSimple: streamAntigravity,
+    // OMP: normalized usage fetcher, so OMP's own usage surfaces can show
+    // Antigravity quota instead of only the /antigravity.usage command.
+    usage: antigravityUsageProvider,
+    // OMP: dynamic model discovery via /v1internal:fetchAvailableModels.
+    // Throws (instead of returning []) when unauthenticated or empty, so OMP
+    // retries in minutes rather than caching an empty catalog for 24h.
+    fetchDynamicModels: async (apiKey: string | undefined) => {
+      if (!apiKey) {
+        throw new Error("Antigravity credentials not available yet. Run /login antigravity first.");
+      }
+      const discovered = await discoverAntigravityModels(apiKey);
+      if (discovered.models.length === 0) {
+        throw new Error("Antigravity model discovery returned no selectable models");
+      }
+      const next = resolvedCatalog(discovered, getCurrentAntigravityCatalog());
+      applyAntigravityCatalog(next);
+      return next.models;
+    },
     oauth: {
       name: PROVIDER_NAME,
       login: loginAntigravity,
       refreshToken: refreshAntigravityToken,
       getApiKey,
     },
-    streamSimple: streamAntigravity,
   });
 
   pi.registerCommand("antigravity.usage", {
@@ -126,14 +175,9 @@ export default function (pi: ExtensionAPI): void {
       }
       if (ctx.hasUI) ctx.ui.notify("Refreshing Antigravity models…", "info");
       try {
-        if (typeof ctx.modelRegistry?.refresh === "function") {
-          const result = await ctx.modelRegistry.refresh({
-            force: true,
-            providers: [PROVIDER_ID],
-          });
-          if (result?.errors?.has(PROVIDER_ID)) {
-            throw result.errors.get(PROVIDER_ID)!;
-          }
+        if (typeof ctx.modelRegistry?.refreshProvider === "function") {
+          // OMP public API: re-runs fetchDynamicModels for this provider online.
+          await ctx.modelRegistry.refreshProvider(PROVIDER_ID, "online");
         } else {
           const discovered = await discoverAntigravityModels(apiKey);
           const next = resolvedCatalog(discovered, getCurrentAntigravityCatalog());
@@ -165,6 +209,7 @@ export default function (pi: ExtensionAPI): void {
       const d = getLastDiagnostics();
       const lines = [
         `provider=${PROVIDER_ID}`,
+        `host=omp`,
         `lastResolvedRuntimeModel=${d.resolvedRuntimeModel || "none"}`,
         `availableModels=${d.availableModels || "none"}`,
         `matchedModel=${d.matchedModelDebug || "none"}`,
@@ -223,49 +268,37 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
-    name: "generate_image",
-    label: "Generate image",
-    description:
-      "Generate an image via Antigravity using the signed-in Google account. Saves under .pi/generated-images/ unless path is set.",
-    promptSnippet: "Generate images via Antigravity OAuth (Gemini image models)",
-    promptGuidelines: [
-      "Use generate_image when the user asks to create, draw, or generate an image.",
-    ],
-    parameters: Type.Object({
-      prompt: Type.String({ description: "Image description." }),
-      aspectRatio: Type.Optional(StringEnum(IMAGE_ASPECT_RATIOS)),
-      model: Type.Optional(
-        Type.String({
-          description: `Image model id. Default: ${DEFAULT_IMAGE_MODEL}.`,
-        }),
-      ),
-      path: Type.Optional(
-        Type.String({
-          description: "Project-relative file or directory to save the image.",
-        }),
-      ),
+    name: "generate_antigravity_image",
+    label: "Generate Antigravity image",
+    approval: "write",
+    description: `Generate an image via Antigravity using the signed-in Google account. Saves under ${DEFAULT_IMAGE_DIR}/ unless path is set.`,
+    parameters: z.object({
+      prompt: z.string().describe("Image description."),
+      aspectRatio: z.enum(IMAGE_ASPECT_RATIOS).optional().describe("Output aspect ratio."),
+      model: z.string().optional().describe(`Image model id. Default: ${DEFAULT_IMAGE_MODEL}.`),
+      path: z.string().optional().describe("Project-relative file or directory to save the image."),
     }),
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      const apiKey = await ctx.modelRegistry.getApiKeyForProvider("antigravity");
+      const apiKey = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER_ID);
       if (!apiKey) {
         throw new Error("No Antigravity credentials. Run /login antigravity first.");
       }
       onUpdate?.({ content: [{ type: "text", text: "Generating image…" }], details: {} });
+      const parsed = readGenerateImageParams(params);
       const result = await generateAntigravityImage({
         apiKey,
         cwd: ctx.cwd,
-        prompt: params.prompt,
-        aspectRatio: params.aspectRatio,
-        model: params.model,
-        path: params.path,
+        prompt: parsed.prompt,
+        aspectRatio: parsed.aspectRatio,
+        model: parsed.model,
+        path: parsed.path,
         signal,
       });
-      const notes = result.text.join(" ").trim();
       return {
         content: [
           {
             type: "text" as const,
-            text: `Saved image to ${result.savedPaths.join(", ")}${notes ? `. ${notes}` : ""}`,
+            text: `Saved image to ${result.savedPaths.join(", ")}`,
           },
           ...result.images.map((image) => ({
             type: "image" as const,

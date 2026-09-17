@@ -5,14 +5,13 @@ import type {
   TextContent,
   ThinkingContent,
   ToolCall,
-} from "@earendil-works/pi-ai";
+} from "@oh-my-pi/pi-ai";
 import type {
   AntigravityRequestType,
   AntigravityUserAgent,
   GeminiRole,
   GeminiToolCallingMode,
   ThinkingEffort,
-  ToolChoice,
 } from "./enums.js";
 
 // OAuth & Auth Types
@@ -49,11 +48,16 @@ export type AntigravityRouting = {
 
 // Stream & API Types
 export const ANTIGRAVITY_API = "antigravity-api" as const;
-export type AntigravityApi = typeof ANTIGRAVITY_API;
 
-export type AntigravityStreamOptions = Omit<SimpleStreamOptions, "toolChoice"> & {
-  toolChoice?: ToolChoice | `${ToolChoice}`;
-};
+/**
+ * OMP hands providers `SimpleStreamOptions` verbatim, so this is a plain alias
+ * rather than a narrowed shape. Narrowing `toolChoice` here would make
+ * `streamSimple` unassignable to the registered `ProviderConfig.streamSimple`
+ * contract, and OMP legitimately sends the object forms of `ToolChoice`
+ * (`{type:"function",name}`, `{type:"tool",name}`, `{type:"computer",name}`)
+ * when a caller forces one tool.
+ */
+export type AntigravityStreamOptions = SimpleStreamOptions;
 
 export type GeminiTextPart = { text: string; thoughtSignature?: string };
 export type GeminiInlineDataPart = { inlineData: { mimeType: string; data: string } };
@@ -99,6 +103,8 @@ export type GeminiFunctionDeclaration = {
 export type GeminiToolConfig = {
   functionCallingConfig: {
     mode: GeminiToolCallingMode;
+    /** Set when the caller forced one specific tool. */
+    allowedFunctionNames?: string[];
   };
 };
 
@@ -162,6 +168,7 @@ export type StreamCandidate = {
 export type StreamResponseData = {
   candidates?: StreamCandidate[];
   usageMetadata?: StreamUsageMetadata;
+  responseId?: string;
 };
 
 export type StreamChunk = StreamResponseData & {

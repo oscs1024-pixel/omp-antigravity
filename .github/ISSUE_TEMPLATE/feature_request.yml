@@ -22,4 +22,4 @@ body:
     id: context
     attributes:
       label: Additional context
-      description: Include any relevant Pi or provider constraints.
+      description: Include any relevant OMP or provider constraints.

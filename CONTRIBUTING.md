@@ -1,12 +1,12 @@
 # Contributing
 
-Thanks for improving `pi-antigravity`.
+Thanks for improving `omp-antigravity`.
 
 ## Before opening an issue
 
 - Search existing issues first.
 - Do not report security vulnerabilities in public issues; follow [SECURITY.md](SECURITY.md).
-- Include the Pi version, package version, operating system, selected model, and sanitized `/antigravity.doctor` output when reporting a bug.
+- Include the OMP version (`omp --version`), plugin version, operating system, selected model, and sanitized `/antigravity.doctor` output when reporting a bug.
 
 ## Development setup
 
@@ -15,7 +15,9 @@ bun install
 bun run check
 ```
 
-This repo uses [Bun](https://bun.sh). `bun run check` runs TypeScript, ESLint, Prettier, and the repository security checks. Run it before opening a pull request.
+This repo uses [Bun](https://bun.sh). `bun run check` runs TypeScript, ESLint, Prettier, the repository security checks, and the test scripts. Run it before opening a pull request.
+
+The test scripts run on a plain Bun host rather than inside OMP, so they resolve OMP-only host symbols (such as the legacy `calculateCost` shim) defensively and skip those assertions when the symbol is absent. Prefer that pattern over importing an OMP-only symbol by name: a named import of a shim-only export fails the whole module outside OMP.
 
 ## Pull requests
 

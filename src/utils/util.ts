@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { getModelEnum } from "../models/models.js";
 
 export function antigravityEnv(name: string): string | undefined {
@@ -14,7 +14,16 @@ export function asString(value: unknown): string | undefined {
 }
 
 export function sanitizeText(text: unknown): string {
-  return String(text ?? "").replace(/[\uD800-\uDFFF]/g, "\uFFFD");
+  const value = String(text ?? "");
+  // Replace only *lone* surrogates — invalid UTF-16 that strict JSON parsers
+  // reject — and leave valid surrogate pairs untouched, so emoji and other
+  // astral-plane characters reach the wire verbatim. Matching the pair first and
+  // returning it unchanged is what separates the two cases: a naive
+  // /[\uD800-\uDFFF]/g replaces each half of a valid pair, turning every emoji in
+  // a user message, system prompt, or tool result into two replacement chars.
+  return value.replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]|[\uD800-\uDFFF]/g, (match) =>
+    match.length === 2 ? match : "\uFFFD",
+  );
 }
 
 export function escapeHtml(text: string): string {
@@ -35,7 +44,7 @@ export function nowRequestId(): string {
 }
 
 /** Deterministic RFC 4122 v5 UUID from seed (survives restarts for the same session seed). */
-export function stableUuid(seed: string): string {
+function stableUuid(seed: string): string {
   const bytes = createHash("sha1").update(seed).digest().subarray(0, 16);
   bytes[6] = (bytes[6] & 0x0f) | 0x50;
   bytes[8] = (bytes[8] & 0x3f) | 0x80;
@@ -52,17 +61,64 @@ export type AntigravityEnvelopeOptions = {
   userTurnIndex?: number;
   trajectoryId?: string;
   conversationId?: string;
+  sessionId?: string;
+  lastExecutionId?: string;
 };
 
-const sessionTrajectoryMap = new Map<string, { conversationId: string; trajectoryId: string }>();
+const INT63_MASK = (1n << 63n) - 1n;
+const ANTIGRAVITY_RANDOM_BOUND = 9_000_000_000_000_000_000n;
+
+export function formatSignedDecimalSessionId(value: bigint): string {
+  return `-${value.toString()}`;
+}
+
+export function deriveSignedDecimalFromHash(text: string): string {
+  const digest = createHash("sha256").update(text).digest();
+  let value = 0n;
+  for (let index = 0; index < 8; index += 1) {
+    value = (value << 8n) | BigInt(digest[index] ?? 0);
+  }
+  return formatSignedDecimalSessionId(value & INT63_MASK);
+}
+
+function randomBoundedInt63(maxExclusive: bigint): bigint {
+  while (true) {
+    const bytes = randomBytes(8);
+    let value = 0n;
+    for (const byte of bytes) {
+      value = (value << 8n) | BigInt(byte);
+    }
+    value &= INT63_MASK;
+    if (value < maxExclusive) {
+      return value;
+    }
+  }
+}
+
+export function randomSignedDecimalSessionId(): string {
+  return formatSignedDecimalSessionId(randomBoundedInt63(ANTIGRAVITY_RANDOM_BOUND));
+}
+
+export type SessionTrajectoryEntry = {
+  conversationId: string;
+  trajectoryId: string;
+  sessionId: string;
+  lastExecutionId?: string;
+};
+
+const sessionTrajectoryMap = new Map<string, SessionTrajectoryEntry>();
 
 /** Stable conversationId and trajectoryId within a multi-turn conversation session. */
 export function resolveSessionTrajectory(context?: {
   messages?: Array<{ role?: string; timestamp?: number; content?: unknown }>;
-}): { conversationId: string; trajectoryId: string } {
+}): SessionTrajectoryEntry {
   const firstMsg = context?.messages?.[0];
   if (!firstMsg) {
-    return { conversationId: crypto.randomUUID(), trajectoryId: crypto.randomUUID() };
+    return {
+      conversationId: crypto.randomUUID(),
+      trajectoryId: crypto.randomUUID(),
+      sessionId: randomSignedDecimalSessionId(),
+    };
   }
   const contentSeed =
     typeof firstMsg.content === "string"
@@ -73,17 +129,38 @@ export function resolveSessionTrajectory(context?: {
   const seed = `${firstMsg.role || "user"}:${firstMsg.timestamp || ""}:${contentSeed}`;
   let entry = sessionTrajectoryMap.get(seed);
   if (!entry) {
+    let rawText = "";
+    if (typeof firstMsg.content === "string") {
+      rawText = firstMsg.content;
+    } else if (Array.isArray(firstMsg.content)) {
+      const parts = firstMsg.content as unknown[];
+      const firstPart = parts[0];
+      if (isRecord(firstPart) && typeof firstPart.text === "string") {
+        rawText = firstPart.text;
+      }
+    }
     entry = {
       conversationId: stableUuid(`antigravity:conv:${seed}`),
       trajectoryId: stableUuid(`antigravity:traj:${seed}`),
+      sessionId: rawText.trim()
+        ? deriveSignedDecimalFromHash(rawText)
+        : randomSignedDecimalSessionId(),
     };
-    sessionTrajectoryMap.set(seed, entry);
     if (sessionTrajectoryMap.size > 64) {
       const oldestKey = sessionTrajectoryMap.keys().next().value;
       if (oldestKey !== undefined) sessionTrajectoryMap.delete(oldestKey);
     }
   }
   return entry;
+}
+export function recordSessionExecutionId(
+  context:
+    { messages?: Array<{ role?: string; timestamp?: number; content?: unknown }> } | undefined,
+  executionId: string | undefined,
+): void {
+  if (!executionId) return;
+  const entry = resolveSessionTrajectory(context);
+  entry.lastExecutionId = executionId;
 }
 
 export function clearSessionTrajectoryMap(): void {
@@ -104,8 +181,7 @@ export function antigravityRequestEnvelope(
   const requestIndex = options.requestIndex ?? options.userTurnIndex ?? Math.max(0, step - 1);
   const agentId = options.conversationId || crypto.randomUUID();
   const trajectoryId = options.trajectoryId || crypto.randomUUID();
-  const bytes = crypto.getRandomValues(new Uint8Array(8));
-  const sessionId = String(new DataView(bytes.buffer, bytes.byteOffset, 8).getBigInt64(0, true));
+  const sessionId = options.sessionId || randomSignedDecimalSessionId();
 
   const claudeLabel = isClaude ? "true" : "false";
   const nonGeminiLabel = isNonGemini ? "true" : "false";
@@ -117,6 +193,7 @@ export function antigravityRequestEnvelope(
     used_claude: claudeLabel,
     used_claude_conservative: claudeLabel,
     used_non_gemini_model: nonGeminiLabel,
+    ...(options.lastExecutionId ? { last_execution_id: options.lastExecutionId } : {}),
   };
 
   const modelEnum = getModelEnum(wireModelId);

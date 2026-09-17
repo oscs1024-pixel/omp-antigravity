@@ -3,8 +3,34 @@ dist/
 *.log
 .DS_Store
 
+# Local agent/tooling state — never part of the published plugin.
+.freebuff/
+.workbuddy/
+.probe/
+
 # Local live-probe dumps (may include email/projectId/quota)
-scripts/probe-results.json
-scripts/probe-tier-results.json
 scripts/smoke-all-models-results.json
+scripts/
+*.test.*
+*.spec.*
+test/
+tests/
 *.tgz
+
+# Secrets, credentials, environment files, and local databases
+.env
+.env.*
+*.env
+*.pem
+*.key
+*.cert
+*.crt
+*.pfx
+*.p12
+*credential*.json
+*secret*.json
+*.sqlite
+*.sqlite3
+*.db
+*.db3
+.omp/

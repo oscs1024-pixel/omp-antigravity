@@ -16,7 +16,8 @@ import { antigravityFetch } from "../utils/http.js";
 import { registerDiscoveredModelEnums, registerModelEnum } from "../models/models.js";
 
 export const DEFAULT_ENDPOINT = "https://daily-cloudcode-pa.googleapis.com";
-export const ENDPOINT_FALLBACKS = [
+/** Ordered endpoint candidates; module-private since `endpointCandidates` is the accessor. */
+const ENDPOINT_FALLBACKS = [
   DEFAULT_ENDPOINT,
   "https://daily-cloudcode-pa.sandbox.googleapis.com",
   "https://cloudcode-pa.googleapis.com",
@@ -26,6 +27,8 @@ const PROJECT_CACHE_TTL_MS = 30 * 60 * 1000;
 const projectCache = new Map<string, { projectId: string | undefined; expiresAt: number }>();
 
 const MODEL_CACHE_TTL_MS = 30 * 60 * 1000;
+/** Hard cap on cached (token, project, model) lookups; oldest entries are dropped first. */
+const MODEL_CACHE_MAX_ENTRIES = 64;
 const modelCache = new Map<string, { result: DynamicModelInfo | undefined; expiresAt: number }>();
 
 /** Metadata lookups (project/model discovery) must be fast; a stalled endpoint should
@@ -93,16 +96,21 @@ export function parseApiKey(apiKeyRaw: string | undefined): AntigravityApiKey {
   if (!apiKeyRaw) {
     throw new Error("No Antigravity OAuth credentials. Run /login antigravity.");
   }
+  let parsed: Partial<AntigravityApiKey> | undefined;
   try {
-    const parsed = JSON.parse(apiKeyRaw) as Partial<AntigravityApiKey>;
-    if (!parsed.token || !parsed.projectId) throw new Error("missing token or projectId");
-    return { token: parsed.token, projectId: parsed.projectId };
-  } catch (error) {
-    throw new Error(
-      `Invalid Antigravity credentials. Run /login antigravity. (${safeError(error)})`,
-      { cause: error },
-    );
+    parsed = JSON.parse(apiKeyRaw) as Partial<AntigravityApiKey>;
+  } catch {
+    // Not JSON — fall through to the bare-token form below.
   }
+  if (parsed?.token) {
+    // Structured form from getApiKey(): {token, projectId}. A missing projectId
+    // is not fatal — callers fall back to loadCodeAssist discovery.
+    return { token: parsed.token, projectId: parsed.projectId ?? "" };
+  }
+  // OMP's AuthStorage.peekApiKey hands OAuth access tokens to extension
+  // fetchDynamicModels as a bare string (no JSON wrapper), so accept that form
+  // too and let callers discover the project id.
+  return { token: apiKeyRaw, projectId: "" };
 }
 
 export function extractProjectId(data: unknown): string | undefined {
@@ -190,7 +198,7 @@ function summarizeModelCandidate(value: unknown): string {
 }
 
 /** Runtime ids look like gemini-*, claude-*, gpt-oss-*, never MODEL_PLACEHOLDER_* enums. */
-export function isUsableRuntimeModelId(id: string): boolean {
+function isUsableRuntimeModelId(id: string): boolean {
   return /^(gemini-|claude-|gpt-oss-)/i.test(id) && !/\s/.test(id) && !/^MODEL_/i.test(id);
 }
 
@@ -370,18 +378,15 @@ export async function fetchAvailableRuntimeModel(
     return await promise;
   } finally {
     inFlightModelLookups.delete(cacheKey);
-    // Evict expired entries; bound map size to avoid unbounded growth.
-    if (modelCache.size > 64) {
-      const now = Date.now();
-      for (const [key, entry] of modelCache) {
-        if (entry.expiresAt <= now) modelCache.delete(key);
-      }
+    // Bound the cache. Dropping only *expired* entries is not a bound: when every
+    // entry is still fresh the map just keeps growing. Insertion order is
+    // oldest-first, so delete from the front until the cap holds (which also
+    // discards expired keys, since those are the oldest).
+    for (const key of modelCache.keys()) {
+      if (modelCache.size <= MODEL_CACHE_MAX_ENTRIES) break;
+      modelCache.delete(key);
     }
   }
-}
-
-export function clearModelCache(): void {
-  modelCache.clear();
 }
 
 async function fetchAvailableModelsFromEndpoint(
@@ -532,10 +537,6 @@ export async function loadCodeAssist(token: string): Promise<string | undefined>
     if (oldestKey !== undefined) projectCache.delete(oldestKey);
   }
   return projectId;
-}
-
-export function clearProjectCache(): void {
-  projectCache.clear();
 }
 
 export function resolveProjectId(opts: {

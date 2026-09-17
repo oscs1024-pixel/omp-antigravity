@@ -10,8 +10,6 @@ export type DiagnosticsSnapshot = {
   availableModels?: string;
   matchedModelDebug?: string;
   latencyMs?: number;
-  maskedEmail?: string;
-  tokenExpiry?: string;
   toolSchemaWarnings?: string;
 };
 
@@ -77,12 +75,6 @@ export function setLastMatchedModelDebug(debug: string | undefined): void {
 }
 export function setLastLatencyMs(ms: number | undefined): void {
   currentBag().latencyMs = ms;
-}
-export function setLastMaskedEmail(email: string | undefined): void {
-  currentBag().maskedEmail = email;
-}
-export function setLastTokenExpiry(expiry: string | undefined): void {
-  currentBag().tokenExpiry = expiry;
 }
 /** Store sanitized tool-schema omissions for the next doctor report. */
 export function setLastToolSchemaWarnings(warnings: string[] | undefined): void {

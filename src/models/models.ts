@@ -1,4 +1,4 @@
-import type { ProviderModelConfig } from "@earendil-works/pi-coding-agent";
+import type { ProviderModelConfig } from "@oh-my-pi/pi-coding-agent";
 import type { AntigravityRouting, ThinkingWire } from "../types/types.js";
 import { ThinkingEffort } from "../types/enums.js";
 import type { AntigravityCatalog } from "./grouping.js";
@@ -19,7 +19,7 @@ export const PROVIDER_NAME = "Antigravity";
  * - Claude Opus 4.6 (Thinking)
  * - GPT-OSS 120B (Medium)
  *
- * Pi exposes those as public model IDs and only surfaces the exact thinking levels
+ * OMP exposes those as public model IDs and only surfaces the exact thinking levels
  * advertised by the backend for each model.
  */
 export const ANTIGRAVITY_ROUTING: Record<string, AntigravityRouting> = {
@@ -118,7 +118,8 @@ export const ANTIGRAVITY_ROUTING: Record<string, AntigravityRouting> = {
  * Verified maximum output tokens accepted by the Cloud Code Assist backend per model/runtime ID.
  * Requesting more than these limits returns a 400 Bad Request from the API.
  */
-export const RUNTIME_MAX_OUTPUT_TOKENS: Record<string, number> = {
+/** Module-private: read through `getMaxOutputTokens`, which also applies the family defaults. */
+const RUNTIME_MAX_OUTPUT_TOKENS: Record<string, number> = {
   "gemini-3.8-flash": 65536,
   "gemini-3.8-flash-low": 65536,
   "gemini-3.8-flash-medium": 65536,
@@ -171,54 +172,84 @@ const claudeSonnetCost = { input: 3.0, output: 15.0, cacheRead: 0.3, cacheWrite:
 const claudeOpusCost = { input: 15.0, output: 75.0, cacheRead: 1.5, cacheWrite: 18.75 };
 const gptOssCost = { input: 0.6, output: 2.4, cacheRead: 0.15, cacheWrite: 0.6 };
 
-// A null entry is intentionally hidden by Pi. Do not collapse levels that happen to
-// route to the same runtime ID: the UI must reflect the levels the backend advertises.
-const thinkingLevelMaps = {
-  lowMediumHigh: {
-    off: null,
-    minimal: null,
-    low: "low",
-    medium: "medium",
-    high: "high",
-    xhigh: null,
-    max: null,
-  },
-  lowHigh: {
-    off: null,
-    minimal: null,
-    low: "low",
-    medium: null,
-    high: "high",
-    xhigh: null,
-    max: null,
-  },
-  thinking: {
-    off: null,
-    minimal: null,
-    low: null,
-    medium: null,
-    high: "high",
-    xhigh: null,
-    max: null,
-  },
-  medium: {
-    off: null,
-    minimal: null,
-    low: null,
-    medium: "medium",
-    high: null,
-    xhigh: null,
-    max: null,
-  },
-} satisfies Record<string, ProviderModelConfig["thinkingLevelMap"]>;
+/**
+ * OMP's canonical thinking metadata for one public model.
+ *
+ * `ProviderModelConfig` has no `thinkingLevelMap` field — that was a pi-era field
+ * which OMP silently ignores, leaving each model's selectable efforts to OMP's
+ * model-id heuristics. Declaring `thinking` instead makes the catalog
+ * self-describing and gives OMP two things it cannot infer:
+ *
+ * - `efforts`: the levels the `/thinking` menu offers and the set OMP clamps a
+ *   requested effort against (`clampThinkingLevelForModel`). A reasoning model
+ *   with no `thinking.efforts` is treated as having no controllable effort
+ *   surface, so the level the user picks would never reach this provider.
+ * - `effortRouting`: the per-effort upstream wire id. OMP builds a reverse index
+ *   from it so a collapsed variant id (`antigravity/gemini-3.8-flash-high`) still
+ *   resolves to this public model.
+ *
+ * `mode: "budget"` matches what this provider actually emits on the wire:
+ * `generationConfig.thinkingConfig.thinkingBudget`.
+ *
+ * `suppressWhenOff` states the Cloud Code Assist requirement explicitly: when
+ * thinking is off this provider sends `thinkingBudget: 0` rather than omitting
+ * `thinkingConfig`, because the backend re-applies the per-runtime-id baked
+ * server default when the config is absent.
+ */
+type AntigravityThinking = NonNullable<ProviderModelConfig["thinking"]>;
 
-/** Same set as `agy models`, collapsed to public Pi model IDs. */
+/**
+ * OMP's effort vocabulary, mirroring `@oh-my-pi/pi-catalog/effort`'s
+ * `THINKING_EFFORTS` ladder. Spelled out as literals because OMP declares
+ * `Effort` as a `const enum`, which an extension cannot import as a value under
+ * `isolatedModules`.
+ *
+ * Because `Effort` is a `const enum`, a member's type (`Effort.Low`) is a
+ * distinct enum-literal type that a plain `"low"` does not satisfy. The two
+ * `as` casts in {@link antigravityThinking} are the only places that lean on the
+ * two vocabularies agreeing, so both need the runtime ladder to stay in sync
+ * with `THINKING_EFFORTS`.
+ */
+type ThinkingLevel = "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
+function antigravityThinking(
+  routing: AntigravityRouting,
+  efforts: readonly ThinkingLevel[],
+  effortBudgets: Partial<Record<ThinkingLevel, number>>,
+): AntigravityThinking {
+  const effortRouting: Record<string, string> = {};
+  if (routing.off) effortRouting.off = routing.off;
+  for (const effort of efforts) {
+    // `ThinkingEffort` mirrors pi's `Effort` minus "max", and no routing table
+    // defines "max"; the cast only lets the wider pi union index the table.
+    const wireId = routing.routing?.[effort as ThinkingEffort];
+    if (wireId) effortRouting[effort] = wireId;
+  }
+  return {
+    mode: "budget",
+    efforts: [...efforts] as AntigravityThinking["efforts"],
+    defaultLevel: efforts[0] as AntigravityThinking["defaultLevel"],
+    effortRouting,
+    effortBudgets: effortBudgets,
+    suppressWhenOff: true,
+  };
+}
+
+/** Same set as `agy models`, collapsed to public OMP model IDs. */
 export const ANTIGRAVITY_MODELS: ProviderModelConfig[] = [
   {
     id: "gemini-3.8-flash",
     name: "Gemini 3.8 Flash (Antigravity)",
     reasoning: true,
-    thinkingLevelMap: thinkingLevelMaps.lowMediumHigh,
+    thinking: antigravityThinking(
+      ANTIGRAVITY_ROUTING["gemini-3.8-flash"],
+      ["low", "medium", "high"],
+      {
+        low: 1000,
+        medium: 4000,
+        high: -1,
+      },
+    ),
     input: ["text", "image"],
     cost: geminiFlashCost,
     contextWindow: 1048576,
@@ -228,7 +259,15 @@ export const ANTIGRAVITY_MODELS: ProviderModelConfig[] = [
     id: "gemini-3.7-flash",
     name: "Gemini 3.7 Flash (Antigravity)",
     reasoning: true,
-    thinkingLevelMap: thinkingLevelMaps.lowMediumHigh,
+    thinking: antigravityThinking(
+      ANTIGRAVITY_ROUTING["gemini-3.7-flash"],
+      ["low", "medium", "high"],
+      {
+        low: 1000,
+        medium: 4000,
+        high: -1,
+      },
+    ),
     input: ["text", "image"],
     cost: geminiFlashCost,
     contextWindow: 1048576,
@@ -238,7 +277,15 @@ export const ANTIGRAVITY_MODELS: ProviderModelConfig[] = [
     id: "gemini-3.6-flash",
     name: "Gemini 3.6 Flash (Antigravity)",
     reasoning: true,
-    thinkingLevelMap: thinkingLevelMaps.lowMediumHigh,
+    thinking: antigravityThinking(
+      ANTIGRAVITY_ROUTING["gemini-3.6-flash"],
+      ["low", "medium", "high"],
+      {
+        low: 1000,
+        medium: 4000,
+        high: -1,
+      },
+    ),
     input: ["text", "image"],
     cost: geminiFlashCost,
     contextWindow: 1048576,
@@ -248,7 +295,7 @@ export const ANTIGRAVITY_MODELS: ProviderModelConfig[] = [
     id: "claude-opus-4-6",
     name: "Claude Opus 4.6 (Antigravity)",
     reasoning: true,
-    thinkingLevelMap: thinkingLevelMaps.thinking,
+    thinking: antigravityThinking(ANTIGRAVITY_ROUTING["claude-opus-4-6"], ["high"], { high: 1024 }),
     input: ["text", "image"],
     cost: claudeOpusCost,
     contextWindow: 250000,
@@ -258,7 +305,9 @@ export const ANTIGRAVITY_MODELS: ProviderModelConfig[] = [
     id: "claude-sonnet-4-6",
     name: "Claude Sonnet 4.6 (Antigravity)",
     reasoning: true,
-    thinkingLevelMap: thinkingLevelMaps.thinking,
+    thinking: antigravityThinking(ANTIGRAVITY_ROUTING["claude-sonnet-4-6"], ["high"], {
+      high: 1024,
+    }),
     input: ["text", "image"],
     cost: claudeSonnetCost,
     contextWindow: 200000,
@@ -268,7 +317,10 @@ export const ANTIGRAVITY_MODELS: ProviderModelConfig[] = [
     id: "gemini-3.1-pro",
     name: "Gemini 3.1 Pro (Antigravity)",
     reasoning: true,
-    thinkingLevelMap: thinkingLevelMaps.lowHigh,
+    thinking: antigravityThinking(ANTIGRAVITY_ROUTING["gemini-3.1-pro"], ["low", "high"], {
+      low: 1001,
+      high: 10001,
+    }),
     input: ["text", "image"],
     cost: geminiProCost,
     contextWindow: 1048576,
@@ -278,7 +330,15 @@ export const ANTIGRAVITY_MODELS: ProviderModelConfig[] = [
     id: "gemini-3.5-flash",
     name: "Gemini 3.5 Flash (Antigravity)",
     reasoning: true,
-    thinkingLevelMap: thinkingLevelMaps.lowMediumHigh,
+    thinking: antigravityThinking(
+      ANTIGRAVITY_ROUTING["gemini-3.5-flash"],
+      ["low", "medium", "high"],
+      {
+        low: 1000,
+        medium: 4000,
+        high: 10000,
+      },
+    ),
     input: ["text", "image"],
     cost: geminiFlashCost,
     contextWindow: 1048576,
@@ -288,7 +348,9 @@ export const ANTIGRAVITY_MODELS: ProviderModelConfig[] = [
     id: "gpt-oss-120b",
     name: "GPT-OSS 120B (Antigravity)",
     reasoning: true,
-    thinkingLevelMap: thinkingLevelMaps.medium,
+    thinking: antigravityThinking(ANTIGRAVITY_ROUTING["gpt-oss-120b"], ["medium"], {
+      medium: 8192,
+    }),
     input: ["text"],
     cost: gptOssCost,
     contextWindow: 131072,
@@ -298,10 +360,6 @@ export const ANTIGRAVITY_MODELS: ProviderModelConfig[] = [
 
 let currentModels: ProviderModelConfig[] = ANTIGRAVITY_MODELS;
 let currentRouting: Record<string, AntigravityRouting> = { ...ANTIGRAVITY_ROUTING };
-
-export function getCurrentAntigravityModels(): ProviderModelConfig[] {
-  return currentModels;
-}
 
 export function getCurrentAntigravityRouting(): Record<string, AntigravityRouting> {
   return currentRouting;
@@ -314,11 +372,6 @@ export function getCurrentAntigravityCatalog(): AntigravityCatalog {
 export function applyAntigravityCatalog(catalog: AntigravityCatalog): void {
   currentModels = catalog.models;
   currentRouting = catalog.routing;
-}
-
-export function resetAntigravityCatalogForTests(): void {
-  currentModels = ANTIGRAVITY_MODELS;
-  currentRouting = { ...ANTIGRAVITY_ROUTING };
 }
 
 /** Resolve public model id + thinking effort to Antigravity runtime model id. */
@@ -378,7 +431,8 @@ export function getFallbackRuntimeModel(runtimeModel: string, effort?: string): 
 
 export type { ThinkingWire };
 
-export const ANTIGRAVITY_MODEL_ENUM: Record<string, string> = {
+/** Module-private: read through `getModelEnum`, which prefers the discovered cache. */
+const ANTIGRAVITY_MODEL_ENUM: Record<string, string> = {
   // Gemini 3.8 Flash
   "gemini-3.8-flash": "MODEL_PLACEHOLDER_M318",
   "gemini-3.8-flash-high": "MODEL_PLACEHOLDER_M318",
@@ -448,24 +502,21 @@ export function getModelEnum(wireModelId: string): string | undefined {
   return modelEnumCache.get(routed) || ANTIGRAVITY_MODEL_ENUM[routed];
 }
 
-/** Return a serializable snapshot of model enums learned from discovery. */
-export function snapshotDynamicModelEnums(): Record<string, string> {
-  return Object.fromEntries(modelEnumCache);
-}
-
-/** Replace dynamically learned model enums with a previously persisted snapshot. */
-export function restoreDynamicModelEnums(modelEnums: Record<string, string>): void {
-  modelEnumCache.clear();
-  for (const [wireModelId, modelEnum] of Object.entries(modelEnums)) {
-    if (wireModelId && modelEnum) modelEnumCache.set(wireModelId, modelEnum);
-  }
-}
-
-export function clearModelEnumCache(): void {
-  modelEnumCache.clear();
-}
-
 export function getThinkingConfig(
+  modelId: string,
+  effort: string | undefined,
+  budgets?: Partial<Record<string, number>>,
+): ThinkingWire | undefined {
+  const config = defaultThinkingConfig(modelId, effort);
+  if (!config || !effort || effort === "off") return config;
+  // OMP's documented precedence for token-based providers is caller `thinkingBudgets`
+  // first, then the model's baked budget, then the provider ladder.
+  const override = budgets?.[effort];
+  if (typeof override !== "number" || !Number.isFinite(override)) return config;
+  return { includeThoughts: true, thinkingBudget: override };
+}
+
+function defaultThinkingConfig(
   modelId: string,
   effort: string | undefined,
 ): ThinkingWire | undefined {

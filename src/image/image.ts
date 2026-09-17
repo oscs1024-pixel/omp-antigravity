@@ -1,9 +1,11 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { lstat, mkdir, realpath, writeFile } from "node:fs/promises";
 import { dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   antigravityHeaders,
+  defaultProjectId,
   endpointCandidates,
   jsonOrTextError,
+  loadCodeAssist,
   parseApiKey,
 } from "../client/client.js";
 import { AntigravityRequestType, AntigravityUserAgent, GeminiRole } from "../types/enums.js";
@@ -33,7 +35,13 @@ const IMAGE_MODEL_FALLBACKS = [
 ];
 const IMAGE_SYSTEM_INSTRUCTION =
   "You are an AI image generator. Generate images based on user descriptions. Focus on creating high-quality, visually appealing images that match the user's request.";
-const DEFAULT_IMAGE_DIR = join(".pi", "generated-images");
+/**
+ * Project-local output directory for generated images.
+ *
+ * OMP's project config directory is `.omp` (pi used `.pi`), so generated images
+ * land in `.omp/generated-images` next to the rest of the project-local state.
+ */
+export const DEFAULT_IMAGE_DIR = join(".omp", "generated-images");
 const MAX_PROMPT_CHARS = 8000;
 
 export type GeneratedImage = { data: string; mimeType: string };
@@ -257,9 +265,33 @@ export async function collectImagesFromSse(
   return { images, text };
 }
 
-async function writeImage(filePath: string, image: GeneratedImage): Promise<string> {
+async function writeImage(cwd: string, filePath: string, image: GeneratedImage): Promise<string> {
+  const root = await realpath(resolve(cwd));
   await mkdir(dirname(filePath), { recursive: true });
-  await writeFile(filePath, Buffer.from(image.data, "base64"));
+  // After mkdir, resolve the real path to defend against symlink traversal:
+  // a symlink in any ancestor directory could redirect writes outside cwd.
+  const realDir = await realpath(dirname(filePath));
+  const realTarget = join(realDir, filePath.slice(dirname(filePath).length + 1));
+  const rel = relative(root, realTarget);
+  if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    throw new Error("Image save path escapes the working directory (symlink traversal).");
+  }
+  // Refuse to overwrite an existing symlink — a link at the final path could
+  // redirect the write to an arbitrary destination even when ancestors are clean.
+  try {
+    const stat = await lstat(realTarget);
+    if (stat.isSymbolicLink()) {
+      throw new Error("Refusing to write through a symbolic link.");
+    }
+  } catch (e: unknown) {
+    // ENOENT is expected for a new file; rethrow anything else.
+    if (e instanceof Error && "code" in e && (e as NodeJS.ErrnoException).code === "ENOENT") {
+      // file does not exist yet — safe
+    } else {
+      throw e;
+    }
+  }
+  await writeFile(realTarget, Buffer.from(image.data, "base64"));
   return filePath;
 }
 
@@ -275,13 +307,14 @@ export async function generateAntigravityImage(
   const preferred = assertSafeImageModel(options.model || DEFAULT_IMAGE_MODEL);
   const models = [preferred, ...IMAGE_MODEL_FALLBACKS.filter((id) => id !== preferred)];
   const creds = parseApiKey(options.apiKey);
+  // Bare-token credentials (OMP peekApiKey form) carry no project id —
+  // discover it the same way the streaming path does.
+  const projectId = creds.projectId || (await loadCodeAssist(creds.token)) || defaultProjectId();
   const headers = antigravityHeaders(creds.token);
 
   let lastError = "no endpoint available";
   for (const model of models) {
-    const body = JSON.stringify(
-      buildImageGenerateRequest(prompt, model, creds.projectId, aspectRatio),
-    );
+    const body = JSON.stringify(buildImageGenerateRequest(prompt, model, projectId, aspectRatio));
     for (const endpoint of endpointCandidates()) {
       if (options.signal?.aborted) throw new Error("Request was aborted");
       try {
@@ -313,6 +346,7 @@ export async function generateAntigravityImage(
         for (const [index, image] of parsed.images.entries()) {
           savedPaths.push(
             await writeImage(
+              options.cwd,
               resolveImageSavePath(
                 options.cwd,
                 options.path,

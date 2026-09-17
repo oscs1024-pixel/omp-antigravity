@@ -1,4 +1,4 @@
-import type { ProviderModelConfig } from "@earendil-works/pi-coding-agent";
+import type { ProviderModelConfig } from "@oh-my-pi/pi-coding-agent";
 import { ThinkingEffort } from "../types/enums.js";
 import type { AntigravityRouting, ModelInfoRaw } from "../types/types.js";
 
@@ -45,8 +45,14 @@ const RUNTIME_ALIASES: Record<string, { publicId: string; level: ThinkingLevel }
   "gemini-pro-agent": { publicId: "gemini-3.1-pro", level: ThinkingEffort.High },
 };
 
-const PI_LEVELS = [
-  ThinkingEffort.Off,
+/**
+ * OMP's effort ladder, ordered least → most intensive.
+ *
+ * `ThinkingEffort.Off` is deliberately absent: OMP's `Effort` union has no "off"
+ * member — an off/disabled request is represented by `reasoning: undefined`, and
+ * `thinking.efforts` must never contain it.
+ */
+const OMP_EFFORTS = [
   ThinkingEffort.Minimal,
   ThinkingEffort.Low,
   ThinkingEffort.Medium,
@@ -57,7 +63,13 @@ const PI_LEVELS = [
 
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
-export function isSelectableRuntimeModelId(id: string): boolean {
+const ANTIGRAVITY_DISCOVERY_DENYLIST = new Set(["chat_20706", "chat_23310", "gemini-2.5-pro"]);
+
+/** Module-private: only `buildAntigravityCatalog` filters raw runtime ids. */
+function isSelectableRuntimeModelId(id: string): boolean {
+  if (ANTIGRAVITY_DISCOVERY_DENYLIST.has(id.toLowerCase())) {
+    return false;
+  }
   if (!/^(gemini-|claude-|gpt-oss-)/i.test(id) || /\s/.test(id) || /^MODEL_/i.test(id)) {
     return false;
   }
@@ -237,7 +249,7 @@ function synthesizeModel(
       id: group.publicId,
       name: publicModelName(group),
       reasoning,
-      thinkingLevelMap: reasoning ? thinkingLevelMapFromLevels(advertisedLevels) : undefined,
+      thinking: thinkingConfigFromLevels(advertisedLevels, routing),
       input: supportsImages ? ["text", "image"] : ["text"],
       cost: template?.cost ?? ZERO_COST,
       contextWindow: template?.contextWindow ?? 128000,
@@ -322,13 +334,39 @@ function routingFromVariants(
   };
 }
 
-function thinkingLevelMapFromLevels(levels: Set<string>): ProviderModelConfig["thinkingLevelMap"] {
-  const map: NonNullable<ProviderModelConfig["thinkingLevelMap"]> = {};
-  for (const level of PI_LEVELS) {
-    map[level] = levels.has(level) ? level : null;
+/**
+ * The official `thinking` metadata shape an extension may attach to a model.
+ * Derived from `ProviderModelConfig` rather than imported so this module keeps
+ * depending on the provider config type only.
+ */
+type AntigravityThinking = NonNullable<ProviderModelConfig["thinking"]>;
+
+function thinkingConfigFromLevels(
+  levels: Set<string>,
+  routing: AntigravityRouting,
+): AntigravityThinking | undefined {
+  const efforts = OMP_EFFORTS.filter((level) => levels.has(level));
+  if (efforts.length === 0) return undefined;
+
+  const effortRouting: Record<string, string> = {};
+  if (routing.off) effortRouting.off = routing.off;
+  for (const effort of efforts) {
+    const wireId = routing.routing?.[effort as ThinkingEffort];
+    if (wireId) effortRouting[effort] = wireId;
   }
-  if (levels.size === 0) map.high = "high";
-  return map;
+
+  // `OMP_EFFORTS` is spelled with local literals because OMP declares `Effort`
+  // as a `const enum`; the cast is the single point that relies on the two
+  // vocabularies agreeing.
+  return {
+    mode: "budget",
+    efforts: [...efforts] as AntigravityThinking["efforts"],
+    defaultLevel: efforts[0] as AntigravityThinking["defaultLevel"],
+    effortRouting,
+    // Cloud Code Assist re-applies the per-runtime-id baked thinking default
+    // when `thinkingConfig` is absent, so an off request must send budget 0.
+    suppressWhenOff: true,
+  };
 }
 
 function familyTemplate(
@@ -371,7 +409,8 @@ function titleCase(value: string): string {
   return value.replace(/\b([a-z])/g, (char) => char.toUpperCase());
 }
 
-export function humanizePublicId(id: string): string {
+/** Module-private: drives `publicModelName` for synthesized catalog entries. */
+function humanizePublicId(id: string): string {
   const tokens = id.split("-");
   const words: string[] = [];
   for (let i = 0; i < tokens.length; i++) {
