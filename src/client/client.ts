@@ -220,11 +220,12 @@ function buildModelMatchRegex(requestedId: string): RegExp {
   if (req.includes("claude-sonnet-4-6")) return /claude.*sonnet.*4\.6/i;
   if (req.includes("gpt-oss-120b")) return /gpt.*oss.*120b/i;
 
-  // Generic rule: parse (Level) suffix (e.g. -low, -medium, -high, -extra-low) + family name,
+  // Generic rule: parse (Level) suffix (e.g. -extra-low, -low, -medium, -high, -extra-high, -minimal) + family name,
   // matching either runtime id form (gemini-3.9-flash-low) or display name form (Gemini 3.9 Flash (Low)).
-  const levelMatch = req.match(/^(.*)-(low|medium|high|extra-low)$/);
+  const levelMatch = req.match(/-(extra-low|extra-high|minimal|medium|high|low)$/);
   if (levelMatch) {
-    const [, base, level] = levelMatch;
+    const level = levelMatch[1];
+    const base = req.slice(0, -(level.length + 1));
     const baseEscaped = escapeRegExp(base).replace(/-/g, "[- ]");
     const levelPattern = level === "extra-low" ? "(?:extra[- ]low|low)" : level;
     return new RegExp(`${baseEscaped}(?:[- ]${levelPattern}|\\s*\\(${levelPattern}\\))`, "i");
