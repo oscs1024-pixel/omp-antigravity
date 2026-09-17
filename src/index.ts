@@ -1,6 +1,6 @@
 import type { ExtensionCommandContext, ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { getApiKey, loginAntigravity, refreshAntigravityToken } from "./auth/index.js";
-import { DEFAULT_ENDPOINT, endpointCandidates } from "./client/index.js";
+import { DEFAULT_ENDPOINT, endpointCandidates, parseApiKey } from "./client/index.js";
 import { getLastDiagnostics, runWithDiagnostics } from "./diagnostics/index.js";
 import {
   DEFAULT_IMAGE_DIR,
@@ -22,11 +22,13 @@ import { ANTIGRAVITY_API, streamAntigravity } from "./stream/index.js";
 import {
   antigravityUsageProvider,
   fetchAccountUsage,
+  formatAccountQuotaSummary,
   formatModelsList,
   formatUsageSummary,
   resolveApiKeyFromContext,
 } from "./usage/index.js";
-import { isRecord, prewarmConnection, redactSecrets } from "./utils/index.js";
+import type { AccountUsage } from "./types/index.js";
+import { isRecord, prewarmConnection, redactSecrets, safeError } from "./utils/index.js";
 
 /**
  * OMP's interactive `ui.notify` writes into the chat transcript. `console.log` in
@@ -41,13 +43,40 @@ function emitCommandOutput(
     ctx.ui.notify(text, type);
     return;
   }
-  if (type === "warning" || type === "error") console.error(text);
-  else console.log(text);
+  process.stdout.write(`${text}\n`);
+}
+interface HostAuthAccount {
+  position: number;
+  credentialId: number;
+  email?: string;
+  orgName?: string;
+  accountId?: string;
+  projectId?: string;
+  active: boolean;
+}
+
+interface HostAuthStorage {
+  listOAuthAccounts(provider: string, sessionId?: string): HostAuthAccount[];
+  pinSessionOAuthAccount(provider: string, sessionId: string, credentialId: number): boolean;
+  getOAuthAccessAt(
+    provider: string,
+    position: number,
+  ): Promise<{ token: string; projectId?: string; email?: string } | undefined>;
+}
+
+function getHostAuthStorage(registry: unknown): HostAuthStorage | undefined {
+  if (isRecord(registry) && "authStorage" in registry && isRecord(registry.authStorage)) {
+    const storage = registry.authStorage;
+    if ("listOAuthAccounts" in storage && typeof storage.listOAuthAccounts === "function") {
+      return storage as unknown as HostAuthStorage;
+    }
+  }
+  return undefined;
 }
 
 async function withUsage(
   ctx: ExtensionCommandContext,
-  fn: (usage: Awaited<ReturnType<typeof fetchAccountUsage>>) => string,
+  fn: (usage: AccountUsage) => string,
 ): Promise<void> {
   try {
     const apiKey = await resolveApiKeyFromContext(ctx);
@@ -130,12 +159,14 @@ export default function (pi: ExtensionAPI): void {
       if (!apiKey) {
         throw new Error("Antigravity credentials not available yet. Run /login antigravity first.");
       }
+      const creds = parseApiKey(apiKey);
+      const projectId = creds.projectId || undefined;
       const discovered = await discoverAntigravityModels(apiKey);
       if (discovered.models.length === 0) {
         throw new Error("Antigravity model discovery returned no selectable models");
       }
       const next = resolvedCatalog(discovered, getCurrentAntigravityCatalog());
-      applyAntigravityCatalog(next);
+      applyAntigravityCatalog(next, projectId);
       return next.models;
     },
     oauth: {
@@ -146,13 +177,117 @@ export default function (pi: ExtensionAPI): void {
     },
   });
 
+  pi.registerCommand("antigravity.accounts", {
+    description:
+      "List stored Antigravity accounts with quota or pin session to an account (usage: /antigravity.accounts [<number|email>])",
+    handler: async (args, ctx) => {
+      const sessionId = ctx.sessionManager?.getSessionId?.();
+      const authStorage = getHostAuthStorage(ctx.modelRegistry);
+
+      if (!authStorage || typeof authStorage.listOAuthAccounts !== "function") {
+        const apiKey = await resolveApiKeyFromContext(ctx);
+        const currentEmail = "default";
+        let currentProj = "unknown";
+        if (apiKey) {
+          try {
+            const parsed = parseApiKey(apiKey);
+            currentProj = parsed.projectId || currentProj;
+          } catch {
+            // bare token
+          }
+        }
+        emitCommandOutput(
+          ctx,
+          `Antigravity accounts:\nActive session account: ${currentEmail} (project: ${currentProj})\n(Host multi-account storage inspection is unavailable in this environment; use /session pin)`,
+        );
+        return;
+      }
+
+      const accounts = authStorage.listOAuthAccounts(PROVIDER_ID, sessionId);
+      if (!accounts.length) {
+        emitCommandOutput(
+          ctx,
+          "No stored OAuth accounts for Antigravity. Run /login antigravity to add an account.",
+          "warning",
+        );
+        return;
+      }
+
+      const targetArg = args?.trim();
+      if (targetArg) {
+        let match = accounts.find((acc) => String(acc.position + 1) === targetArg);
+        if (!match) {
+          const lower = targetArg.toLowerCase();
+          match = accounts.find(
+            (acc) =>
+              acc.email?.toLowerCase().includes(lower) ||
+              acc.projectId?.toLowerCase().includes(lower),
+          );
+        }
+        if (!match) {
+          emitCommandOutput(
+            ctx,
+            `No Antigravity account matching "${targetArg}". Available accounts:\n` +
+              accounts
+                .map((a) => `  #${a.position + 1}: ${a.email || a.projectId || "account"}`)
+                .join("\n"),
+            "warning",
+          );
+          return;
+        }
+        if (!sessionId) {
+          emitCommandOutput(ctx, "Current session ID is not available to pin account.", "error");
+          return;
+        }
+        authStorage.pinSessionOAuthAccount(PROVIDER_ID, sessionId, match.credentialId);
+        emitCommandOutput(
+          ctx,
+          `[Antigravity] Pinned session to Account #${match.position + 1} (${match.email || match.projectId || "account"}).`,
+          "info",
+        );
+        return;
+      }
+
+      if (ctx.hasUI) ctx.ui.notify("Checking Antigravity accounts quota…", "info");
+
+      const lines: string[] = [`Antigravity Accounts (${accounts.length} stored)`];
+      for (const acc of accounts) {
+        const num = `#${acc.position + 1}`;
+        const marker = acc.active ? "* " : "  ";
+        const tag = acc.active ? " [ACTIVE]" : "";
+        const emailLabel = acc.email || "(no email)";
+        const projLabel = acc.projectId ? ` (project: ${acc.projectId})` : "";
+        lines.push(`${marker}${num}: ${emailLabel}${projLabel}${tag}`);
+
+        try {
+          const access = await authStorage.getOAuthAccessAt(PROVIDER_ID, acc.position);
+          if (access?.token) {
+            const usage = await fetchAccountUsage(
+              JSON.stringify({
+                token: access.token,
+                projectId: access.projectId || acc.projectId || "",
+              }),
+            );
+            lines.push(`     ${formatAccountQuotaSummary(usage)}`);
+          } else {
+            lines.push("     Quota: unable to resolve access token");
+          }
+        } catch (error) {
+          lines.push(`     Quota: unavailable (${safeError(error).slice(0, 100)})`);
+        }
+      }
+
+      lines.push("");
+      lines.push("Switch: /antigravity.accounts <number|email> or /session pin <number|email>");
+      emitCommandOutput(ctx, lines.join("\n"));
+    },
+  });
   pi.registerCommand("antigravity.usage", {
     description: "Show Antigravity shared quota pools (Gemini / Claude+GPT, 5h + weekly)",
     handler: async (_args, ctx) => {
       await withUsage(ctx, formatUsageSummary);
     },
   });
-
   pi.registerCommand("antigravity.models", {
     description: "List Antigravity runtime models + remaining pool fraction",
     handler: async (args, ctx) => {
@@ -179,10 +314,12 @@ export default function (pi: ExtensionAPI): void {
           // OMP public API: re-runs fetchDynamicModels for this provider online.
           await ctx.modelRegistry.refreshProvider(PROVIDER_ID, "online");
         } else {
+          const creds = parseApiKey(apiKey);
+          const projectId = creds.projectId || undefined;
           const discovered = await discoverAntigravityModels(apiKey);
           const next = resolvedCatalog(discovered, getCurrentAntigravityCatalog());
           if (discovered.models.length > 0) {
-            applyAntigravityCatalog(next);
+            applyAntigravityCatalog(next, projectId);
           }
         }
         const catalog = getCurrentAntigravityCatalog();
@@ -206,7 +343,16 @@ export default function (pi: ExtensionAPI): void {
   pi.registerCommand("antigravity.doctor", {
     description: "Show sanitized Antigravity provider diagnostics",
     handler: async (_args, ctx) => {
-      const d = getLastDiagnostics();
+      const apiKey = await resolveApiKeyFromContext(ctx);
+      let projectId: string | undefined;
+      if (apiKey) {
+        try {
+          projectId = parseApiKey(apiKey).projectId || undefined;
+        } catch {
+          // bare token
+        }
+      }
+      const d = getLastDiagnostics(projectId);
       const lines = [
         `provider=${PROVIDER_ID}`,
         `host=omp`,
@@ -221,7 +367,7 @@ export default function (pi: ExtensionAPI): void {
         `lastError=${d.error ? redactSecrets(d.error) : "none"}`,
         "transport=native-streamSimple",
         "runtimeCli=not-used",
-        "commands=/antigravity.usage /antigravity.models /antigravity.refresh /antigravity.doctor /antigravity.image",
+        "commands=/antigravity.accounts /antigravity.usage /antigravity.models /antigravity.refresh /antigravity.doctor /antigravity.image",
       ];
       emitCommandOutput(ctx, `Antigravity doctor\n${lines.join("\n")}`);
     },
@@ -279,7 +425,8 @@ export default function (pi: ExtensionAPI): void {
       path: z.string().optional().describe("Project-relative file or directory to save the image."),
     }),
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      const apiKey = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER_ID);
+      const sessionId = ctx.sessionManager?.getSessionId?.();
+      const apiKey = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER_ID, sessionId);
       if (!apiKey) {
         throw new Error("No Antigravity credentials. Run /login antigravity first.");
       }

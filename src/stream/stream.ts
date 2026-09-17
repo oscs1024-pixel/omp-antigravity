@@ -86,7 +86,7 @@ export function streamAntigravity(
       // overrides `reasoning`, exactly as `buildRequest` applies it below.
       const effort = resolveRequestedEffort(opts);
       const isKnownModel = model.id in getCurrentAntigravityRouting();
-      const baseRuntimeModel = resolveInitialRuntimeModel(model.id, opts);
+      const baseRuntimeModel = resolveInitialRuntimeModel(model.id, opts, projectId);
 
       let initialRuntimeModel = baseRuntimeModel;
       // Skip pre-flight model discovery for known static models to optimize TTFT latency.
@@ -237,7 +237,7 @@ export function streamAntigravity(
         const streamed = await streamResponse(response, stream, output, model, context);
         received = streamed.received;
         if (streamed.responseId) {
-          recordSessionExecutionId(context, streamed.responseId);
+          recordSessionExecutionId(context, streamed.responseId, projectId);
         }
         if (received) {
           rawStopReason = streamed.rawStopReason;

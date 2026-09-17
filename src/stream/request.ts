@@ -92,10 +92,11 @@ export function resolveRequestedEffort(options: AntigravityStreamOptions): strin
 export function resolveInitialRuntimeModel(
   modelId: string,
   options: AntigravityStreamOptions,
+  projectId?: string,
 ): string {
   return (
     antigravityEnv("RUNTIME_MODEL")?.trim() ||
-    getAntigravityRequestModelId(modelId, resolveRequestedEffort(options))
+    getAntigravityRequestModelId(modelId, resolveRequestedEffort(options), projectId)
   );
 }
 
@@ -207,7 +208,7 @@ export function buildRequest(
       (m) => m.role === "assistant" && m.stopReason !== "error" && m.stopReason !== "aborted",
     ).length ?? 0;
 
-  const trajectory = resolveSessionTrajectory(context);
+  const trajectory = resolveSessionTrajectory(context, projectId);
 
   const envelope = antigravityRequestEnvelope(runtimeModel, {
     isClaude,

@@ -89,6 +89,10 @@ async function getUserEmail(token: string): Promise<string | undefined> {
     return undefined;
   }
 }
+export function deriveFallbackEmail(refreshToken: string): string {
+  const hash = createHash("sha256").update(refreshToken).digest("hex").slice(0, 12);
+  return `antigravity-${hash}@oauth.local`;
+}
 
 function closeServerGracefully(server: Server): void {
   if ("closeAllConnections" in server && typeof server.closeAllConnections === "function") {
@@ -383,15 +387,16 @@ export async function loginAntigravity(
       );
     }
 
-    const [email, discoveredProject] = await Promise.all([
+    const [fetchedEmail, discoveredProject] = await Promise.all([
       getUserEmail(tokenData.access_token),
       loadCodeAssist(tokenData.access_token),
     ]);
+    const email = fetchedEmail || deriveFallbackEmail(tokenData.refresh_token);
     return {
       refresh: tokenData.refresh_token,
       access: tokenData.access_token,
       expires: Date.now() + tokenData.expires_in * 1000 - 5 * 60 * 1000,
-      projectId: discoveredProject || defaultProjectId(email || "antigravity-default"),
+      projectId: discoveredProject || defaultProjectId(email),
       email,
     };
   } finally {
@@ -427,14 +432,14 @@ export async function refreshAntigravityToken(
   // project id (the normal case; it's set at login and doesn't change token to token).
   const existingProjectId = credentialProjectId(credentials);
   const discoveredProject = existingProjectId ? undefined : await loadCodeAssist(data.access_token);
-  const email = credentialEmail(credentials);
+  const email = credentialEmail(credentials) || deriveFallbackEmail(credentials.refresh);
   return {
     ...credentials,
     refresh: data.refresh_token || credentials.refresh,
     access: data.access_token,
     expires: Date.now() + data.expires_in * 1000 - 5 * 60 * 1000,
-    projectId:
-      existingProjectId || discoveredProject || defaultProjectId(email || "antigravity-default"),
+    projectId: existingProjectId || discoveredProject || defaultProjectId(email),
+    email,
   };
 }
 

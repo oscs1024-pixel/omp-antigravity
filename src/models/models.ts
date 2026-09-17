@@ -360,6 +360,7 @@ export const ANTIGRAVITY_MODELS: ProviderModelConfig[] = [
 
 let currentModels: ProviderModelConfig[] = ANTIGRAVITY_MODELS;
 let currentRouting: Record<string, AntigravityRouting> = { ...ANTIGRAVITY_ROUTING };
+const catalogsByProject = new Map<string, AntigravityCatalog>();
 
 export function getCurrentAntigravityRouting(): Record<string, AntigravityRouting> {
   return currentRouting;
@@ -369,14 +370,33 @@ export function getCurrentAntigravityCatalog(): AntigravityCatalog {
   return { models: currentModels, routing: currentRouting };
 }
 
-export function applyAntigravityCatalog(catalog: AntigravityCatalog): void {
-  currentModels = catalog.models;
-  currentRouting = catalog.routing;
+export function getAntigravityCatalogForProject(projectId?: string): AntigravityCatalog {
+  if (projectId && catalogsByProject.has(projectId)) {
+    return catalogsByProject.get(projectId)!;
+  }
+  return { models: currentModels, routing: currentRouting };
+}
+
+export function applyAntigravityCatalog(catalog: AntigravityCatalog, projectId?: string): void {
+  if (projectId) {
+    catalogsByProject.set(projectId, catalog);
+  }
+  const existingMap = new Map<string, ProviderModelConfig>();
+  for (const m of currentModels) existingMap.set(m.id, m);
+  for (const m of catalog.models) existingMap.set(m.id, m);
+  currentModels = Array.from(existingMap.values());
+  currentRouting = { ...currentRouting, ...catalog.routing };
 }
 
 /** Resolve public model id + thinking effort to Antigravity runtime model id. */
-export function getAntigravityRequestModelId(modelId: string, effort: string | undefined): string {
-  const r = currentRouting[modelId] ?? ANTIGRAVITY_ROUTING[modelId];
+export function getAntigravityRequestModelId(
+  modelId: string,
+  effort: string | undefined,
+  projectId?: string,
+): string {
+  const projectCatalog = projectId ? catalogsByProject.get(projectId) : undefined;
+  const r =
+    projectCatalog?.routing[modelId] ?? currentRouting[modelId] ?? ANTIGRAVITY_ROUTING[modelId];
   if (!r) return modelId;
 
   if (effort === undefined || effort === "off") {

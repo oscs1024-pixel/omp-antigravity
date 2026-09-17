@@ -109,9 +109,12 @@ export type SessionTrajectoryEntry = {
 const sessionTrajectoryMap = new Map<string, SessionTrajectoryEntry>();
 
 /** Stable conversationId and trajectoryId within a multi-turn conversation session. */
-export function resolveSessionTrajectory(context?: {
-  messages?: Array<{ role?: string; timestamp?: number; content?: unknown }>;
-}): SessionTrajectoryEntry {
+export function resolveSessionTrajectory(
+  context?: {
+    messages?: Array<{ role?: string; timestamp?: number; content?: unknown }>;
+  },
+  projectId?: string,
+): SessionTrajectoryEntry {
   const firstMsg = context?.messages?.[0];
   if (!firstMsg) {
     return {
@@ -126,7 +129,7 @@ export function resolveSessionTrajectory(context?: {
       : Array.isArray(firstMsg.content)
         ? JSON.stringify(firstMsg.content[0] ?? "").slice(0, 64)
         : "";
-  const seed = `${firstMsg.role || "user"}:${firstMsg.timestamp || ""}:${contentSeed}`;
+  const seed = `${projectId || "default"}:${firstMsg.role || "user"}:${firstMsg.timestamp || ""}:${contentSeed}`;
   let entry = sessionTrajectoryMap.get(seed);
   if (!entry) {
     let rawText = "";
@@ -146,6 +149,7 @@ export function resolveSessionTrajectory(context?: {
         ? deriveSignedDecimalFromHash(rawText)
         : randomSignedDecimalSessionId(),
     };
+    sessionTrajectoryMap.set(seed, entry);
     if (sessionTrajectoryMap.size > 64) {
       const oldestKey = sessionTrajectoryMap.keys().next().value;
       if (oldestKey !== undefined) sessionTrajectoryMap.delete(oldestKey);
@@ -157,9 +161,10 @@ export function recordSessionExecutionId(
   context:
     { messages?: Array<{ role?: string; timestamp?: number; content?: unknown }> } | undefined,
   executionId: string | undefined,
+  projectId?: string,
 ): void {
   if (!executionId) return;
-  const entry = resolveSessionTrajectory(context);
+  const entry = resolveSessionTrajectory(context, projectId);
   entry.lastExecutionId = executionId;
 }
 

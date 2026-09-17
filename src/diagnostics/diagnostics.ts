@@ -17,6 +17,7 @@ const storage = new AsyncLocalStorage<DiagnosticsSnapshot>();
 
 /** Last completed request snapshot for `/antigravity.doctor`. */
 let lastSnapshot: DiagnosticsSnapshot = {};
+const snapshotsByProject = new Map<string, DiagnosticsSnapshot>();
 
 function currentBag(): DiagnosticsSnapshot {
   return storage.getStore() ?? lastSnapshot;
@@ -30,11 +31,17 @@ export async function runWithDiagnostics<T>(fn: () => Promise<T>): Promise<T> {
       return await fn();
     } finally {
       lastSnapshot = { ...bag };
+      if (bag.projectId) {
+        snapshotsByProject.set(bag.projectId, { ...bag });
+      }
     }
   });
 }
 
-export function getLastDiagnostics(): Readonly<DiagnosticsSnapshot> {
+export function getLastDiagnostics(projectId?: string): Readonly<DiagnosticsSnapshot> {
+  if (projectId && snapshotsByProject.has(projectId)) {
+    return snapshotsByProject.get(projectId)!;
+  }
   return lastSnapshot;
 }
 
@@ -85,4 +92,5 @@ export function setLastToolSchemaWarnings(warnings: string[] | undefined): void 
 /** Test helper: reset last snapshot between cases. */
 export function resetDiagnosticsForTests(): void {
   lastSnapshot = {};
+  snapshotsByProject.clear();
 }

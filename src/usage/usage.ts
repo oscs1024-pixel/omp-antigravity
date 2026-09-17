@@ -302,6 +302,26 @@ export function formatUsageSummary(usage: AccountUsage): string {
 
   return lines.join("\n").trimEnd();
 }
+export function formatAccountQuotaSummary(usage: AccountUsage): string {
+  const parts: string[] = [];
+  if (usage.planLabel) {
+    parts.push(`[${usage.planLabel}]`);
+  }
+  for (const group of usage.groups) {
+    for (const bucket of group.buckets) {
+      const pct = Math.round(bucket.remainingFraction * 100);
+      const reset = bucket.resetTime ? ` (resets ${formatReset(bucket.resetTime)})` : "";
+      parts.push(`${bucket.displayName}: ${pct}%${reset}`);
+    }
+  }
+  if (!parts.length) {
+    if (usage.quotaSummaryError && /SUBSCRIPTION_REQUIRED|#3501/i.test(usage.quotaSummaryError)) {
+      return "Free Tier (quota summary requires paid subscription)";
+    }
+    return "Quota: available";
+  }
+  return parts.join(" | ");
+}
 
 export function formatModelsList(usage: AccountUsage, opts?: { all?: boolean }): string {
   const lines: string[] = [];
@@ -488,7 +508,8 @@ export async function resolveApiKeyFromContext(
   ctx: ExtensionCommandContext,
 ): Promise<string | undefined> {
   try {
-    return await ctx.modelRegistry.getApiKeyForProvider(PROVIDER_ID);
+    const sessionId = ctx.sessionManager?.getSessionId?.();
+    return await ctx.modelRegistry.getApiKeyForProvider(PROVIDER_ID, sessionId);
   } catch {
     return undefined;
   }

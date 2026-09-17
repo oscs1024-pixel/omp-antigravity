@@ -143,6 +143,7 @@ flowchart TD
   - **无头/远程模式**：在远程服务器或 SSH 场景下，浏览器无法直连 localhost。用户复制重定向后浏览器地址栏的完整 URL（包含 `code` 与 `state`），直接粘贴到 OMP 终端的提示符，插件内置安全提取与校验解析器。
 - **自动开通 (Onboarding)**：换取 Token 后调用 `loadCodeAssist` 检查账号层级；若账号为新开通未分配项目状态，自动调用 `/v1internal:onboardUser` 申请免费层分配并以指数退避轮询等待就绪，真实绑定 Google 分配的 `cloudaicompanionProject`。
 - **Token 刷新与防抖**：OMP `AuthStorage` 托管 Token 过期检测，在失效前透明调用 `refreshAntigravityToken`。
+- **原生多账号池与会话锁定**：支持多次运行 `/login antigravity` 登录多个不同 Google 账号，OMP 宿主 `AuthStorage` 依据独立邮箱去重并隔离存储/刷新。支持使用 `/antigravity.accounts` 或 `/session pin` 查看各账号配额并锁定会话；当遇 429 配额耗尽时 OMP 自动冷却并轮转至额度充足的兄弟账号。
 
 ```mermaid
 sequenceDiagram
@@ -447,16 +448,17 @@ omp plugin uninstall omp-antigravity
 
 ### 斜杠命令 (Slash Commands)
 
-| 命令                            | 描述                                                                                                                |
-| ------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `/login antigravity`            | 启动 Google OAuth 授权登录流程。                                                                                    |
-| `/model antigravity/<model-id>` | 切换至指定的 Antigravity 模型。                                                                                     |
-| `/antigravity.usage`            | 打印当前账号各共享配额池（Gemini / Claude + GPT）的剩余百分比与重置倒计时。                                         |
-| `/antigravity.models`           | 查看当前账号生效的动态运行时模型及各池状态。                                                                        |
-| `/antigravity.models all`       | 包含默认隐藏的内部 Chat / Tab 补全底层模型。                                                                        |
-| `/antigravity.refresh`          | 强制从服务端拉取最新的动态模型列表并更新本地映射。                                                                  |
-| `/antigravity.doctor`           | 输出已脱敏的运行时健康诊断信息（当前端点、状态码、生效模型 ID、延迟等）。                                           |
-| `/antigravity.image <prompt>`   | 手动生成图片并保存至 `.omp/generated-images/`。支持参数 `--ratio <ratio>`、`--model <model>`、`--path <filepath>`。 |
+| 命令                          | 描述                                                                                                                |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `/login antigravity`          | 启动 Google OAuth 授权登录流程。                                                                                    |
+| `/antigravity.accounts`       | 列出所有存储的 Antigravity 账号、当前会话锁定状态及各账号实时配额。                                                 |
+| `/antigravity.accounts <1     | email>`                                                                                                             | 为当前会话锁定指定账号（支持序号、邮箱或项目 ID 匹配）。 |
+| `/antigravity.usage`          | 打印当前账号各共享配额池（Gemini / Claude + GPT）的剩余百分比与重置倒计时。                                         |
+| `/antigravity.models`         | 查看当前账号生效的动态运行时模型及各池状态。                                                                        |
+| `/antigravity.models all`     | 包含默认隐藏的内部 Chat / Tab 补全底层模型。                                                                        |
+| `/antigravity.refresh`        | 强制从服务端拉取最新的动态模型列表并更新本地映射。                                                                  |
+| `/antigravity.doctor`         | 输出已脱敏的运行时健康诊断信息（当前端点、状态码、生效模型 ID、延迟等）。                                           |
+| `/antigravity.image <prompt>` | 手动生成图片并保存至 `.omp/generated-images/`。支持参数 `--ratio <ratio>`、`--model <model>`、`--path <filepath>`。 |
 
 ### LLM 可调用工具 (`generate_antigravity_image`)
 
