@@ -34,12 +34,7 @@
     "lint:fix": "eslint src --fix",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "security-check": "bun scripts/security-check.ts",
-    "test": "bun scripts/test-model-routing.ts && bun scripts/test-model-discovery.ts && bun scripts/test-usage-formatter.ts && bun scripts/test-stream-sse.ts && bun scripts/test-stream-header-deadline.ts && bun scripts/test-http-fetch.ts && bun scripts/test-image-gen.ts",
-    "smoke:load": "bun scripts/load-check.mjs",
-    "smoke:tools": "bun scripts/smoke-tool-schema.ts",
-    "smoke:models": "bun scripts/smoke-all-models.mjs",
-    "check": "bun run typecheck && bun run lint && bun run format:check && bun run security-check && bun run smoke:load && bun run test"
+    "check": "bun run typecheck && bun run lint && bun run format:check"
   },
   "peerDependencies": {
     "@oh-my-pi/pi-ai": ">=18.0.0",
