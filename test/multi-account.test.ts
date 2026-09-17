@@ -349,7 +349,10 @@ describe("antigravity.accounts command output formatting", () => {
 
     const emitted: string[] = [];
     const mockCtx = {
-      hasUI: false,
+      hasUI: true,
+      ui: {
+        notify: (msg: string) => emitted.push(msg),
+      },
       sessionManager: {
         getSessionId: () => "test-session-123",
       },
@@ -399,29 +402,17 @@ describe("antigravity.accounts command output formatting", () => {
       },
     } as unknown as ExtensionCommandContext;
 
-    // Intercept console.log
-    const originalLog = console.log;
-    console.log = (msg: string) => {
-      emitted.push(msg);
-    };
-
-    try {
-      await registeredCommands["antigravity.accounts"].handler("", mockCtx);
-    } finally {
-      console.log = originalLog;
-    }
+    await registeredCommands["antigravity.accounts"].handler("", mockCtx);
 
     const output = emitted.join("\n");
     assert.ok(output.includes("Antigravity Accounts (2 stored)"));
     assert.ok(output.includes("\x1b[32m●\x1b[0m #1: vulnhubs@gmail.com"));
     assert.ok(output.includes("[ACTIVE]"));
     assert.ok(output.includes("#2: oscs1024@gmail.com"));
-    assert.ok(output.includes("Switch account:"));
+    assert.ok(output.includes("Switch:"));
     assert.ok(output.includes("/antigravity.accounts 2"));
-    assert.ok(output.includes("/antigravity.accounts 1"));
-    assert.ok(output.includes("/antigravity.accounts oscs1024"));
   });
-  it("marks Account #1 as ACTIVE (default) with green dot when no account is explicitly active", async () => {
+  it("displays neutral no-pin status when no account is explicitly active", async () => {
     type CommandEntry = { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> };
     const registeredCommands: Record<string, CommandEntry> = {};
     const dummyNode: Record<string, unknown> = {};
@@ -508,7 +499,8 @@ describe("antigravity.accounts command output formatting", () => {
     }
 
     const output = emitted.join("\n");
-    assert.ok(output.includes("\x1b[32m●\x1b[0m #1: vulnhubs@gmail.com"));
-    assert.ok(output.includes("[ACTIVE (default)]"));
+    assert.ok(output.includes("no pin — host auto-selects"));
+    assert.ok(!output.includes("[ACTIVE]"));
+    assert.ok(!output.includes("\x1b[32m●\x1b[0m"));
   });
 });

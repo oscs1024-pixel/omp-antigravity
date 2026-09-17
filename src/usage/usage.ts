@@ -332,18 +332,17 @@ export function formatAccountQuotaSummary(usage: AccountUsage): string {
     for (const bucket of group.buckets) {
       const pct = Math.round(bucket.remainingFraction * 100);
       const reset = bucket.resetTime ? ` (resets ${formatReset(bucket.resetTime)})` : "";
-      if (
-        /^(?:Five Hour|Weekly|Daily)\s+Limit(?:\s+Remaining)?$/i.test(bucket.displayName.trim())
-      ) {
+      const trimmed = bucket.displayName.trim();
+      const bLabel = /^five[\s_-]*hour(?:\s+limit)?(?:\s+remaining)?$/i.test(trimmed)
+        ? "5h"
+        : /^weekly(?:\s+limit)?(?:\s+remaining)?$/i.test(trimmed)
+          ? "weekly"
+          : /^daily(?:\s+limit)?(?:\s+remaining)?$/i.test(trimmed)
+            ? "daily"
+            : trimmed.replace(/\s+limit\s+remaining$/i, "");
+      if (bLabel !== trimmed) {
         hasGenericBucket = true;
       }
-      const bLabel = bucket.displayName
-        .replace(/^Five Hour Limit Remaining$/i, "5h")
-        .replace(/^Five Hour Limit$/i, "5h")
-        .replace(/^Weekly Limit Remaining$/i, "weekly")
-        .replace(/^Weekly Limit$/i, "weekly")
-        .replace(/\s+Limit Remaining$/i, "")
-        .trim();
       bucketParts.push(`${bLabel}: ${pct}%${reset}`);
     }
     if (!bucketParts.length) continue;

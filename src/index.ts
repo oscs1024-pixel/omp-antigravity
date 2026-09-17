@@ -238,22 +238,18 @@ export default function (pi: ExtensionAPI): void {
 
       if (ctx.hasUI) ctx.ui.notify("Checking Antigravity accounts quota…", "info");
 
+      const useColor = ctx.hasUI || Boolean(process.stdout?.isTTY);
       const hasExplicitActive = accounts.some((a) => a.active);
-      const lines: string[] = [`Antigravity Accounts (${accounts.length} stored)`];
+      const titleSuffix = hasExplicitActive ? "" : " (no pin — host auto-selects)";
+      const lines: string[] = [`Antigravity Accounts (${accounts.length} stored${titleSuffix})`];
       const accountRows = await Promise.all(
         accounts.map(async (acc) => {
           const num = `#${acc.position + 1}`;
-          const isSelected = acc.active || (!hasExplicitActive && acc.position === 0);
-          const statusDot = isSelected ? "\x1b[32m●\x1b[0m" : " ";
-          const tag = acc.active
-            ? " \x1b[32m[ACTIVE]\x1b[0m"
-            : !hasExplicitActive && acc.position === 0
-              ? " \x1b[32m[ACTIVE (default)]\x1b[0m"
-              : "";
+          const statusDot = acc.active ? (useColor ? "\x1b[32m●\x1b[0m" : "●") : " ";
+          const tag = acc.active ? (useColor ? " \x1b[32m[ACTIVE]\x1b[0m" : " [ACTIVE]") : "";
           const emailLabel = acc.email || "(no email)";
           const projLabel = acc.projectId ? ` (project: ${acc.projectId})` : "";
           const header = `  ${statusDot} ${num}: ${emailLabel}${projLabel}${tag}`;
-
           try {
             let accessToken: string | undefined;
             let projectId: string | undefined = acc.projectId;
@@ -307,24 +303,9 @@ export default function (pi: ExtensionAPI): void {
       );
       lines.push(...accountRows);
       lines.push("");
-      lines.push("Switch account:");
-      if (accounts.length > 1) {
-        const targetAcc =
-          accounts.find((a) => (hasExplicitActive ? !a.active : a.position !== 0)) || accounts[1];
-        if (targetAcc) {
-          lines.push(
-            `  /antigravity.accounts ${targetAcc.position + 1}             (switch session to Account #${targetAcc.position + 1})`,
-          );
-        }
-        lines.push(`  /antigravity.accounts 1             (switch session to Account #1)`);
-        const emailPrefix = targetAcc?.email ? targetAcc.email.split("@")[0] : undefined;
-        if (emailPrefix) {
-          lines.push(`  /antigravity.accounts ${emailPrefix}        (switch by email keyword)`);
-        }
-      } else {
-        lines.push("  /antigravity.accounts 1             (pin current session to Account #1)");
-      }
-      lines.push("  /session pin <number|email>         (OMP built-in session pin)");
+      lines.push(
+        "Switch: /antigravity.accounts <number|email> (e.g. /antigravity.accounts 2) or /session pin <number>",
+      );
       emitCommandOutput(ctx, lines.join("\n"));
     },
   });
