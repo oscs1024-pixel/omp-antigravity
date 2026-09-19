@@ -362,6 +362,7 @@ export const ANTIGRAVITY_MODELS: ProviderModelConfig[] = [
 let currentModels: ProviderModelConfig[] = ANTIGRAVITY_MODELS;
 let currentRouting: Record<string, AntigravityRouting> = { ...ANTIGRAVITY_ROUTING };
 const MAX_PROJECT_CATALOGS = 64;
+const MAX_MODEL_ENUMS = 64;
 const catalogsByProject = new Map<string, AntigravityCatalog>();
 
 export function getCurrentAntigravityRouting(): Record<string, AntigravityRouting> {
@@ -497,7 +498,7 @@ const modelEnumCache = new Map<string, string>();
 /** Register dynamically discovered model enum (e.g. from fetchAvailableModels). */
 export function registerModelEnum(wireModelId: string, modelEnum: string): void {
   if (wireModelId && modelEnum) {
-    modelEnumCache.set(wireModelId, modelEnum);
+    setWithCap(modelEnumCache, wireModelId, modelEnum, MAX_MODEL_ENUMS);
   }
 }
 
@@ -508,7 +509,7 @@ export function registerDiscoveredModelEnums(
   if (!models) return;
   for (const [wireId, info] of Object.entries(models)) {
     if (typeof info?.model === "string" && info.model) {
-      modelEnumCache.set(wireId, info.model);
+      setWithCap(modelEnumCache, wireId, info.model, MAX_MODEL_ENUMS);
     }
   }
 }

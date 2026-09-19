@@ -25,7 +25,7 @@ const ENDPOINT_FALLBACKS = [
 const PROJECT_CACHE_TTL_MS = 30 * 60 * 1000;
 /** Hard cap on cached (token) project id lookups; oldest entries are dropped first. */
 const PROJECT_CACHE_MAX_ENTRIES = 64;
-const projectCache = new Map<string, { projectId: string | undefined; expiresAt: number }>();
+const projectCache = new Map<string, { projectId: string; expiresAt: number }>();
 
 const MODEL_CACHE_TTL_MS = 30 * 60 * 1000;
 /** Hard cap on cached (token, project, model) lookups; oldest entries are dropped first. */
@@ -617,12 +617,14 @@ export async function loadCodeAssist(token: string): Promise<string | undefined>
   }
 
   const projectId = await loadCodeAssistUncached(token);
-  projectCache.set(token, { projectId, expiresAt: Date.now() + PROJECT_CACHE_TTL_MS });
+  if (projectId) {
+    projectCache.set(token, { projectId, expiresAt: Date.now() + PROJECT_CACHE_TTL_MS });
 
-  // Discard oldest entries when exceeding capacity cap.
-  for (const key of projectCache.keys()) {
-    if (projectCache.size <= PROJECT_CACHE_MAX_ENTRIES) break;
-    projectCache.delete(key);
+    // Discard oldest entries when exceeding capacity cap.
+    for (const key of projectCache.keys()) {
+      if (projectCache.size <= PROJECT_CACHE_MAX_ENTRIES) break;
+      projectCache.delete(key);
+    }
   }
   return projectId;
 }

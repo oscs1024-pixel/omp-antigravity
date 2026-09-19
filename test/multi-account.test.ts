@@ -11,7 +11,12 @@ import {
   setLastProjectId,
   setLastStatus,
 } from "../src/diagnostics/diagnostics.js";
-import { applyAntigravityCatalog, getAntigravityRequestModelId } from "../src/models/models.js";
+import {
+  applyAntigravityCatalog,
+  getAntigravityRequestModelId,
+  getModelEnum,
+  registerModelEnum,
+} from "../src/models/models.js";
 import { ThinkingEffort } from "../src/types/enums.js";
 import type { AccountUsage } from "../src/types/types.js";
 import { formatAccountQuotaSummary } from "../src/usage/usage.js";
@@ -78,6 +83,17 @@ describe("setWithCap LRU cache utility", () => {
     assert.equal(map.has(5), false);
     assert.equal(map.has(6), true);
     assert.equal(map.has(69), true);
+  });
+});
+
+describe("dynamic model enum cache", () => {
+  it("evicts old enum entries after reaching its capacity", () => {
+    for (let i = 0; i < 65; i += 1) {
+      registerModelEnum(`dynamic-cap-test-${i}`, `DYNAMIC_CAP_TEST_${i}`);
+    }
+
+    assert.equal(getModelEnum("dynamic-cap-test-0"), undefined);
+    assert.equal(getModelEnum("dynamic-cap-test-64"), "DYNAMIC_CAP_TEST_64");
   });
 });
 
@@ -228,9 +244,9 @@ describe("formatAccountQuotaSummary", () => {
     };
 
     const summary = formatAccountQuotaSummary(usage);
-    assert.ok(summary.includes("[Google AI Pro]"));
-    assert.ok(summary.includes("Gemini: 95%"));
-    assert.ok(summary.includes("Claude/GPT: 50%"));
+    assert.ok(summary.startsWith("Plan: Google AI Pro\n"));
+    assert.match(summary, /Gemini\s+95% left\s+\[##########\]/);
+    assert.match(summary, /Claude\/GPT\s+50% left\s+\[#####-----\]/);
   });
 
   it("handles free-tier 403 gracefully", () => {
@@ -292,11 +308,11 @@ describe("formatAccountQuotaSummary", () => {
     };
 
     const summary = formatAccountQuotaSummary(usage);
-    assert.ok(summary.includes("[Google AI Pro (g1-pro-tier)]"));
-    assert.ok(summary.includes("Gemini (5h: 55%"));
-    assert.ok(summary.includes("weekly: 62%"));
-    assert.ok(summary.includes("Claude/Other (5h: 100%"));
-    assert.ok(summary.includes("weekly: 67%"));
+    assert.ok(summary.startsWith("Plan: Google AI Pro (g1-pro-tier)\n"));
+    assert.match(summary, /Gemini\n  5h\s+55% left\s+\[######----\]/);
+    assert.match(summary, /Weekly\s+62% left\s+\[######----\]/);
+    assert.match(summary, /Claude\/Other\n  5h\s+100% left\s+\[##########\]/);
+    assert.match(summary, /Weekly\s+67% left\s+\[#######---\]/);
   });
   it("formats validation-required accounts with account verification link", () => {
     const usage: AccountUsage = {
@@ -313,7 +329,7 @@ describe("formatAccountQuotaSummary", () => {
     };
 
     const summary = formatAccountQuotaSummary(usage);
-    assert.ok(summary.includes("[Google AI Pro (g1-pro-tier)]"));
+    assert.ok(summary.startsWith("Plan: Google AI Pro (g1-pro-tier)\n"));
     assert.ok(summary.includes("Account verification required:"));
     assert.ok(summary.includes("https://accounts.google.com/signin/continue"));
   });
@@ -408,9 +424,10 @@ describe("antigravity.accounts command output formatting", () => {
     assert.ok(output.includes("Antigravity Accounts (2 stored)"));
     assert.ok(output.includes("\x1b[32m●\x1b[0m #1: vulnhubs@gmail.com"));
     assert.ok(output.includes("[ACTIVE]"));
-    assert.ok(output.includes("#2: oscs1024@gmail.com"));
-    assert.ok(output.includes("Switch:"));
-    assert.ok(output.includes("/antigravity.accounts 2"));
+    assert.ok(output.includes("○ #2: oscs1024@gmail.com"));
+    assert.ok(output.includes("\n      Project: aicode-consumers\n"));
+    assert.ok(output.includes("Switch account:\n  /antigravity.accounts <number|email>"));
+    assert.ok(output.includes("Example: /antigravity.accounts 2"));
   });
   it("displays neutral no-pin status when no account is explicitly active", async () => {
     type CommandEntry = { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> };

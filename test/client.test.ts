@@ -4,6 +4,7 @@ import {
   AntigravityHttpError,
   buildModelMatchRegex,
   isRetryableEndpointStatus,
+  loadCodeAssist,
   postAntigravityJson,
   type PostJsonResponse,
 } from "../src/client/client.js";
@@ -218,6 +219,34 @@ describe("postAntigravityJson retry policy", () => {
       assert.equal(res.status, 200);
       assert.equal(res.data.projectId, "proj-123");
       assert.equal(callCount, 2, "Should have retried after 404 and succeeded on second endpoint");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+describe("loadCodeAssist project cache", () => {
+  const originalFetch = globalThis.fetch;
+
+  it("recovers on the next discovery call after a transient failure", async () => {
+    let attempt = 0;
+    globalThis.fetch = (async () => {
+      attempt++;
+      if (attempt === 1) {
+        return new Response(JSON.stringify({ error: { message: "temporary failure" } }), {
+          status: 403,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ projectId: "recovered-project" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as typeof fetch;
+
+    try {
+      assert.equal(await loadCodeAssist("transient-failure-token"), undefined);
+      assert.equal(await loadCodeAssist("transient-failure-token"), "recovered-project");
     } finally {
       globalThis.fetch = originalFetch;
     }

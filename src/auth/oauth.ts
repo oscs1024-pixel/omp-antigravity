@@ -2,6 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@oh-my-pi/pi-ai";
 import { defaultProjectId, loadCodeAssist } from "../client/client.js";
+import { antigravityFetch } from "../utils/http.js";
 import { escapeHtml, antigravityEnv } from "../utils/util.js";
 import { resolveCallbackHost, redactSecrets } from "../utils/security.js";
 import type { AntigravityOAuthCredentials, CallbackServer } from "../types/types.js";
@@ -79,7 +80,7 @@ function generatePKCE(): { verifier: string; challenge: string } {
 
 async function getUserEmail(token: string): Promise<string | undefined> {
   try {
-    const res = await fetch("https://www.googleapis.com/oauth2/v1/userinfo?alt=json", {
+    const res = await antigravityFetch("https://www.googleapis.com/oauth2/v1/userinfo?alt=json", {
       headers: { Authorization: `Bearer ${token}` },
     });
     if (!res.ok) return undefined;
@@ -146,13 +147,11 @@ function startCallbackServer(expectedState: string): Promise<CallbackServer> {
       if (!code || !state) {
         res.writeHead(400, oauthCallbackHeaders());
         res.end("Antigravity authentication failed: missing code or state.");
-        finish(() => rejectCode(new Error("Missing code or state in OAuth callback")));
         return;
       }
       if (state !== expectedState) {
         res.writeHead(400, oauthCallbackHeaders());
         res.end("Antigravity authentication failed: invalid state.");
-        finish(() => rejectCode(new Error("OAuth state mismatch")));
         return;
       }
 

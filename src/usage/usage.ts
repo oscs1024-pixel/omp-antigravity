@@ -65,15 +65,6 @@ function formatReset(resetTime?: string): string {
   return `${mins}m`;
 }
 
-async function postJson(
-  path: string,
-  token: string,
-  body: Record<string, unknown>,
-  signal?: AbortSignal,
-): Promise<{ endpoint: string; status: number; data: unknown }> {
-  return postAntigravityJson(path, token, body, { signal });
-}
-
 function parseQuotaSummary(data: unknown): { groups: QuotaGroup[]; description?: string } {
   const summary = (isRecord(data) ? data : {}) as QuotaSummaryRaw;
   const groups: QuotaGroup[] = [];
@@ -161,7 +152,7 @@ function parseTier(value: unknown): TierInfo | undefined {
 
 async function loadCodeAssistSafe(token: string, signal?: AbortSignal) {
   try {
-    return await postJson(
+    return await postAntigravityJson(
       "/v1internal:loadCodeAssist",
       token,
       {
@@ -171,7 +162,7 @@ async function loadCodeAssistSafe(token: string, signal?: AbortSignal) {
           pluginType: "GEMINI",
         },
       },
-      signal,
+      { signal },
     );
   } catch {
     return null;
@@ -197,7 +188,12 @@ async function fetchQuotaSummarySafe(
   try {
     return {
       ok: true,
-      result: await postJson("/v1internal:retrieveUserQuotaSummary", token, {}, signal),
+      result: await postAntigravityJson(
+        "/v1internal:retrieveUserQuotaSummary",
+        token,
+        {},
+        { signal },
+      ),
     };
   } catch (error) {
     let validationUrl: string | undefined;
@@ -318,70 +314,70 @@ export function formatUsageSummary(usage: AccountUsage): string {
   return lines.join("\n").trimEnd();
 }
 export function formatAccountQuotaSummary(usage: AccountUsage): string {
-  const quotaParts: string[] = [];
-  const hasMultipleGroups = usage.groups.length > 1;
+  const lines: string[] = [];
+  if (usage.planLabel) {
+    lines.push(`Plan: ${usage.planLabel}`);
+  }
+
   for (const group of usage.groups) {
-    const rawGroup = group.displayName || "";
+    if (!group.buckets.length) continue;
+
+    const rawGroup = group.displayName.trim();
     const groupLabel = rawGroup
       .replace(/\s+models$/i, "")
       .replace(/\s*(?:and|&)\s+other\b/i, "/Other")
       .trim();
-    const bucketParts: string[] = [];
-    let hasGenericBucket = false;
+    if (groupLabel && !/quota\s*group/i.test(rawGroup)) {
+      lines.push(groupLabel);
+    }
 
-    for (const bucket of group.buckets) {
-      const pct = Math.round(bucket.remainingFraction * 100);
-      const reset = bucket.resetTime ? ` (resets ${formatReset(bucket.resetTime)})` : "";
-      const trimmed = bucket.displayName.trim();
-      const bLabel = /^five[\s_-]*hour(?:\s+limit)?(?:\s+remaining)?$/i.test(trimmed)
+    const buckets = group.buckets.map((bucket) => {
+      const rawLabel = bucket.displayName.trim();
+      const label = /^five[\s_-]*hour(?:\s+limit)?(?:\s+remaining)?$/i.test(rawLabel)
         ? "5h"
-        : /^weekly(?:\s+limit)?(?:\s+remaining)?$/i.test(trimmed)
-          ? "weekly"
-          : /^daily(?:\s+limit)?(?:\s+remaining)?$/i.test(trimmed)
-            ? "daily"
-            : trimmed.replace(/\s+limit\s+remaining$/i, "");
-      if (bLabel !== trimmed) {
-        hasGenericBucket = true;
-      }
-      bucketParts.push(`${bLabel}: ${pct}%${reset}`);
-    }
-    if (!bucketParts.length) continue;
+        : /^weekly(?:\s+limit)?(?:\s+remaining)?$/i.test(rawLabel)
+          ? "Weekly"
+          : /^daily(?:\s+limit)?(?:\s+remaining)?$/i.test(rawLabel)
+            ? "Daily"
+            : rawLabel.replace(/\s+limit\s+remaining$/i, "");
+      return { bucket, label };
+    });
+    const labelWidth = Math.max(...buckets.map(({ label }) => label.length));
 
-    if ((hasMultipleGroups || hasGenericBucket) && groupLabel && !/quota\s*group/i.test(rawGroup)) {
-      quotaParts.push(`${groupLabel} (${bucketParts.join(", ")})`);
-    } else {
-      quotaParts.push(...bucketParts);
-    }
-  }
-
-  if (!quotaParts.length) {
-    if (
-      usage.validationUrl ||
-      /VALIDATION_REQUIRED|verify your account/i.test(usage.quotaSummaryError || "")
-    ) {
-      quotaParts.push(
-        usage.validationUrl
-          ? `Account verification required: ${usage.validationUrl}`
-          : "Account verification required (Google human verification challenge)",
+    for (const { bucket, label } of buckets) {
+      const percent = `${Math.round(bucket.remainingFraction * 100)}%`.padStart(4);
+      const reset = bucket.resetTime ? `  resets ${formatReset(bucket.resetTime)}` : "";
+      lines.push(
+        `  ${label.padEnd(labelWidth)}  ${percent} left  ${progressBar(bucket.remainingFraction, 10)}${reset}`,
       );
-    } else if (
-      usage.quotaSummaryError &&
-      /SUBSCRIPTION_REQUIRED|#3501/i.test(usage.quotaSummaryError)
-    ) {
-      quotaParts.push("Free Tier (quota summary requires paid subscription)");
-    } else if (usage.quotaSummaryError) {
-      quotaParts.push(`Quota: unavailable (${usage.quotaSummaryError.slice(0, 100)})`);
-    } else {
-      quotaParts.push("Quota: available");
     }
   }
 
-  const parts: string[] = [];
-  if (usage.planLabel) {
-    parts.push(`[${usage.planLabel}]`);
+  if (usage.groups.some((group) => group.buckets.length > 0)) {
+    return lines.join("\n");
   }
-  parts.push(...quotaParts);
-  return parts.join(" | ");
+
+  if (
+    usage.validationUrl ||
+    /VALIDATION_REQUIRED|verify your account/i.test(usage.quotaSummaryError || "")
+  ) {
+    lines.push(
+      usage.validationUrl
+        ? `Account verification required: ${usage.validationUrl}`
+        : "Account verification required (Google human verification challenge)",
+    );
+  } else if (
+    usage.quotaSummaryError &&
+    /SUBSCRIPTION_REQUIRED|#3501/i.test(usage.quotaSummaryError)
+  ) {
+    lines.push("Free Tier (quota summary requires paid subscription)");
+  } else if (usage.quotaSummaryError) {
+    lines.push(`Quota unavailable: ${usage.quotaSummaryError.slice(0, 100)}`);
+  } else {
+    lines.push("Quota available");
+  }
+
+  return lines.join("\n");
 }
 
 export function formatModelsList(usage: AccountUsage, opts?: { all?: boolean }): string {

@@ -252,11 +252,11 @@ export default function (pi: ExtensionAPI): void {
       const accountRows = await Promise.all(
         accounts.map(async (acc) => {
           const num = `#${acc.position + 1}`;
-          const statusDot = acc.active ? (useColor ? "\x1b[32m●\x1b[0m" : "●") : " ";
+          const statusDot = acc.active ? (useColor ? "\x1b[32m●\x1b[0m" : "●") : "○";
           const tag = acc.active ? (useColor ? " \x1b[32m[ACTIVE]\x1b[0m" : " [ACTIVE]") : "";
           const emailLabel = acc.email || "(no email)";
-          const projLabel = acc.projectId ? ` (project: ${acc.projectId})` : "";
-          const header = `  ${statusDot} ${num}: ${emailLabel}${projLabel}${tag}`;
+          const header = `  ${statusDot} ${num}: ${emailLabel}${tag}`;
+          const projectLine = `      Project: ${acc.projectId || "unknown"}`;
           try {
             let accessToken: string | undefined;
             let projectId: string | undefined = acc.projectId;
@@ -292,7 +292,7 @@ export default function (pi: ExtensionAPI): void {
                 if (access.projectId) projectId = access.projectId;
               } else {
                 const err = access && !access.ok ? access.error : "offline";
-                return `${header}\n     Quota: unable to resolve access token (${err})`;
+                return `${header}\n${projectLine}\n      Quota: unable to resolve access token (${err})`;
               }
             }
 
@@ -302,17 +302,21 @@ export default function (pi: ExtensionAPI): void {
                 projectId: projectId || "",
               }),
             );
-            return `${header}\n     ${formatAccountQuotaSummary(usage)}`;
+            const quotaLines = formatAccountQuotaSummary(usage)
+              .split("\n")
+              .map((line) => `      ${line}`)
+              .join("\n");
+            return `${header}\n${projectLine}\n${quotaLines}`;
           } catch (error) {
-            return `${header}\n     Quota: unavailable (${safeError(error).slice(0, 100)})`;
+            return `${header}\n${projectLine}\n      Quota unavailable: ${safeError(error).slice(0, 100)}`;
           }
         }),
       );
-      lines.push(...accountRows);
-      lines.push("");
-      lines.push(
-        "Switch: /antigravity.accounts <number|email> (e.g. /antigravity.accounts 2) or /session pin <number>",
-      );
+      lines.push("", accountRows.join("\n\n"), "");
+      lines.push("Switch account:");
+      lines.push("  /antigravity.accounts <number|email>");
+      lines.push("  /session pin <number>");
+      lines.push("Example: /antigravity.accounts 2");
       emitCommandOutput(ctx, lines.join("\n"));
     },
   });
