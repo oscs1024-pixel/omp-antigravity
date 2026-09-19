@@ -220,6 +220,7 @@ export function buildRequest(
     trajectoryId: trajectory.trajectoryId,
     sessionId: options.sessionId || trajectory.sessionId,
     lastExecutionId: trajectory.lastExecutionId,
+    projectId,
   });
   request.sessionId = envelope.sessionId;
   request.labels = envelope.labels;

@@ -58,7 +58,7 @@ export function nowRequestId(): string {
 }
 
 /** Deterministic RFC 4122 v5 UUID from seed (survives restarts for the same session seed). */
-function stableUuid(seed: string): string {
+export function stableUuid(seed: string): string {
   const bytes = createHash("sha1").update(seed).digest().subarray(0, 16);
   bytes[6] = (bytes[6] & 0x0f) | 0x50;
   bytes[8] = (bytes[8] & 0x3f) | 0x80;
@@ -77,6 +77,8 @@ export type AntigravityEnvelopeOptions = {
   conversationId?: string;
   sessionId?: string;
   lastExecutionId?: string;
+  /** Routes model_enum lookups through the per-account catalog when set. */
+  projectId?: string;
 };
 
 const INT63_MASK = (1n << 63n) - 1n;
@@ -125,6 +127,7 @@ const sessionTrajectoryMap = new Map<string, SessionTrajectoryEntry>();
 /** Stable conversationId and trajectoryId within a multi-turn conversation session. */
 export function resolveSessionTrajectory(
   context?: {
+    systemPrompt?: string[] | string;
     messages?: Array<{ role?: string; timestamp?: number; content?: unknown }>;
   },
   projectId?: string,
@@ -137,13 +140,21 @@ export function resolveSessionTrajectory(
       sessionId: randomSignedDecimalSessionId(),
     };
   }
-  const contentSeed =
-    typeof firstMsg.content === "string"
-      ? firstMsg.content.slice(0, 64)
-      : Array.isArray(firstMsg.content)
-        ? JSON.stringify(firstMsg.content[0] ?? "").slice(0, 64)
-        : "";
-  const seed = `${projectId || "default"}:${firstMsg.role || "user"}:${firstMsg.timestamp || ""}:${contentSeed}`;
+  // Hash the full first message (and system prompt) rather than truncating: two
+  // conversations that share the first 64 chars but diverge later must not share
+  // a trajectory or lastExecutionId. Genuinely identical openings still collide —
+  // they are indistinguishable by definition.
+  const systemSeed = Array.isArray(context?.systemPrompt)
+    ? context.systemPrompt.join("\n")
+    : typeof context?.systemPrompt === "string"
+      ? context.systemPrompt
+      : "";
+  const contentSeed = createHash("sha256")
+    .update(
+      `${projectId || "default"}${firstMsg.role || "user"}${firstMsg.timestamp ?? ""}${systemSeed}${typeof firstMsg.content === "string" ? firstMsg.content : JSON.stringify(firstMsg.content ?? "")}`,
+    )
+    .digest("hex");
+  const seed = contentSeed;
   let entry = sessionTrajectoryMap.get(seed);
   if (!entry) {
     let rawText = "";
@@ -213,7 +224,7 @@ export function antigravityRequestEnvelope(
       : {}),
   };
 
-  const modelEnum = getModelEnum(wireModelId);
+  const modelEnum = getModelEnum(wireModelId, options.projectId);
   if (modelEnum) {
     labels.model_enum = modelEnum;
   }
