@@ -227,7 +227,14 @@ export default function (pi: ExtensionAPI): void {
           emitCommandOutput(ctx, "Current session ID is not available to pin account.", "error");
           return;
         }
-        authStorage.pinSessionOAuthAccount(PROVIDER_ID, sessionId, match.credentialId);
+        if (!authStorage.pinSessionOAuthAccount(PROVIDER_ID, sessionId, match.credentialId)) {
+          emitCommandOutput(
+            ctx,
+            `Failed to pin session to Account #${match.position + 1}: credential unavailable or a runtime/config override is active.`,
+            "error",
+          );
+          return;
+        }
         emitCommandOutput(
           ctx,
           `[Antigravity] Pinned session to Account #${match.position + 1} (${match.email || match.projectId || "account"}).`,

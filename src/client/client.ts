@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import {
   getCurrentAvailableModels,
   getCurrentEndpoint,
@@ -11,7 +10,7 @@ import {
 } from "../diagnostics/diagnostics.js";
 import { assertSafeApiBaseUrl, safeError } from "../utils/security.js";
 import type { AntigravityApiKey, AvailableModelsRaw, DynamicModelInfo } from "../types/types.js";
-import { antigravityEnv, asString, escapeRegExp, isRecord } from "../utils/util.js";
+import { antigravityEnv, asString, escapeRegExp, isRecord, stableUuid } from "../utils/util.js";
 import { antigravityFetch } from "../utils/http.js";
 import { registerDiscoveredModelEnums, registerModelEnum } from "../models/models.js";
 
@@ -42,11 +41,7 @@ const inFlightModelLookups = new Map<string, Promise<DynamicModelInfo | undefine
 
 /** UUID-shaped stable id from a seed (account email preferred over cwd). */
 export function stableProjectId(seed: string): string {
-  const bytes = createHash("sha1").update(`antigravity:${seed}`).digest().subarray(0, 16);
-  bytes[6] = (bytes[6] & 0x0f) | 0x50;
-  bytes[8] = (bytes[8] & 0x3f) | 0x80;
-  const hex = [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  return stableUuid(`antigravity:${seed}`);
 }
 
 /**

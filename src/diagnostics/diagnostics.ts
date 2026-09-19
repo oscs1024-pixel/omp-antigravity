@@ -41,8 +41,10 @@ export async function runWithDiagnostics<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 export function getLastDiagnostics(projectId?: string): Readonly<DiagnosticsSnapshot> {
-  if (projectId && snapshotsByProject.has(projectId)) {
-    return snapshotsByProject.get(projectId)!;
+  if (projectId) {
+    // A known account with no snapshot returns empty rather than another
+    // account's last request — doctor output stays scoped to its own project.
+    return snapshotsByProject.get(projectId) ?? {};
   }
   return lastSnapshot;
 }

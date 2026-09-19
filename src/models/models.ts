@@ -514,13 +514,14 @@ export function registerDiscoveredModelEnums(
 }
 
 /** Get model_enum label for a given wire model id (dynamic cache first, then static fallback). */
-export function getModelEnum(wireModelId: string): string | undefined {
+export function getModelEnum(wireModelId: string, projectId?: string): string | undefined {
   const direct = modelEnumCache.get(wireModelId) || ANTIGRAVITY_MODEL_ENUM[wireModelId];
   if (direct) return direct;
 
   // Runtime overrides may name a public/base model while discovery only returned
-  // an enum for its selected runtime variant (for example `-low`).
-  const routed = getAntigravityRequestModelId(wireModelId, undefined);
+  // an enum for its selected runtime variant (for example `-low`). Scoped to the
+  // caller's project so another account's catalog cannot leak into the label.
+  const routed = getAntigravityRequestModelId(wireModelId, undefined, projectId);
   return modelEnumCache.get(routed) || ANTIGRAVITY_MODEL_ENUM[routed];
 }
 

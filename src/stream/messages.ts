@@ -137,6 +137,22 @@ export function convertMessages(
   const contents: GeminiContent[] = [];
   const requiresSig = geminiRequiresThoughtSignature(runtimeModel);
   const droppedToolCallIds = new Map<string, string>();
+  // FIFO pairing for tool calls with no host-provided id: an emitted functionCall
+  // queues the generated id so its toolResult reuses it, and a dropped call queues
+  // a marker so its result takes the observation path. Results arrive in call
+  // order, so per-name queues pair nth call with nth result.
+  const pendingEmptyToolCalls = new Map<
+    string,
+    ({ emittedId: string } | { droppedArgs: string })[]
+  >();
+  const queueEmptyCall = (
+    name: string,
+    entry: { emittedId: string } | { droppedArgs: string },
+  ): void => {
+    const queue = pendingEmptyToolCalls.get(name);
+    if (queue) queue.push(entry);
+    else pendingEmptyToolCalls.set(name, [entry]);
+  };
   for (const msg of context.messages) {
     // OMP adds a "developer" role alongside "user"; both are instruction-type
     // user turns on the Cloud Code Assist wire, so handle them identically.
@@ -178,8 +194,8 @@ export function convertMessages(
             ...(block.thinkingSignature ? { thoughtSignature: block.thinkingSignature } : {}),
           });
         } else if (block.type === "toolCall") {
+          const rawId = block.id || "";
           if (requiresSig && !groupIsSigned) {
-            const rawId = block.id || "";
             const argsText = (() => {
               try {
                 return JSON.stringify(block.arguments ?? {});
@@ -191,16 +207,27 @@ export function convertMessages(
               droppedToolCallIds.set(rawId, argsText);
               droppedToolCallIds.set(sanitizeToolCallId(rawId, block.name), argsText);
             } else {
-              droppedToolCallIds.set(`empty:${block.name}`, argsText);
+              queueEmptyCall(block.name, { droppedArgs: argsText });
             }
           } else {
+            let callId: string | undefined;
+            if (toolCallIdNeeded(model.id, runtimeModel)) {
+              if (rawId) {
+                callId = sanitizeToolCallId(rawId, block.name);
+              } else {
+                callId = sanitizeToolCallId("", block.name);
+                queueEmptyCall(block.name, { emittedId: callId });
+              }
+            } else if (!rawId) {
+              // Keep the queue aligned even when ids are not sent on the wire,
+              // so a dropped call's result cannot consume an emitted call's slot.
+              queueEmptyCall(block.name, { emittedId: "" });
+            }
             parts.push({
               functionCall: {
                 name: block.name,
                 args: block.arguments ?? {},
-                ...(toolCallIdNeeded(model.id, runtimeModel)
-                  ? { id: sanitizeToolCallId(block.id || "", block.name) }
-                  : {}),
+                ...(callId ? { id: callId } : {}),
               },
               ...(block.thoughtSignature ? { thoughtSignature: block.thoughtSignature } : {}),
             });
@@ -216,13 +243,18 @@ export function convertMessages(
       const responseText = text || (msg.isError ? "Tool failed" : "");
       const imageParts = asImageParts(msg.content);
       const rawId = msg.toolCallId || "";
-      const sanitizedId = toolCallIdNeeded(model.id, runtimeModel)
-        ? sanitizeToolCallId(rawId, msg.toolName)
-        : rawId;
+      const sanitizedId = rawId
+        ? toolCallIdNeeded(model.id, runtimeModel)
+          ? sanitizeToolCallId(rawId, msg.toolName)
+          : rawId
+        : "";
+      const pending = rawId === "" ? pendingEmptyToolCalls.get(msg.toolName)?.shift() : undefined;
       const droppedArgs = requiresSig
-        ? (droppedToolCallIds.get(rawId) ??
-          droppedToolCallIds.get(sanitizedId) ??
-          (rawId === "" ? droppedToolCallIds.get(`empty:${msg.toolName}`) : undefined))
+        ? rawId
+          ? (droppedToolCallIds.get(rawId) ?? droppedToolCallIds.get(sanitizedId))
+          : pending && "droppedArgs" in pending
+            ? pending.droppedArgs
+            : undefined
         : undefined;
       if (droppedArgs !== undefined) {
         const label =
@@ -232,13 +264,20 @@ export function convertMessages(
           ...imageParts,
         ]);
       } else {
+        // Empty rawId: reuse the id the paired functionCall was emitted with, so
+        // Claude/GPT-OSS see matching call/response ids instead of a fresh counter.
+        const responseId = rawId
+          ? sanitizedId
+          : toolCallIdNeeded(model.id, runtimeModel)
+            ? pending && "emittedId" in pending && pending.emittedId
+              ? pending.emittedId
+              : sanitizeToolCallId("", msg.toolName)
+            : "";
         const part: GeminiFunctionResponsePart = {
           functionResponse: {
             name: msg.toolName,
             response: msg.isError ? { error: responseText } : { output: responseText },
-            ...(toolCallIdNeeded(model.id, runtimeModel)
-              ? { id: sanitizeToolCallId(msg.toolCallId || "", msg.toolName) }
-              : {}),
+            ...(responseId ? { id: responseId } : {}),
           },
         };
         appendTurn(contents, GeminiRole.User, [part, ...imageParts]);

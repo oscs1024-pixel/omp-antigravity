@@ -263,8 +263,18 @@ async function acquireAuthCode(
   const settle = new AbortController();
   const candidates: Promise<{ code: string; state: string }>[] = [waitForCode()];
 
+  // Rejects when either the user cancels or another candidate wins, so a pending
+  // onPrompt (which may not honor AbortSignal itself) does not outlive the race.
+  const abortSignals = [settle.signal, ...(callbacks.signal ? [callbacks.signal] : [])];
+  const promptAborted = (signal: AbortSignal): Promise<never> =>
+    new Promise((_resolve, reject) => {
+      if (signal.aborted) return reject(new Error("Login cancelled"));
+      signal.addEventListener("abort", () => reject(new Error("Login cancelled")), { once: true });
+    });
+
   // Manual paste path: offered whenever the callback surface can prompt.
   if (typeof callbacks.onPrompt === "function") {
+    const onPrompt = callbacks.onPrompt.bind(callbacks);
     const promptLoop = async (): Promise<{ code: string; state: string }> => {
       let promptMessage =
         "Remote/headless machine (your browser can't reach localhost:51121)? " +
@@ -275,10 +285,13 @@ async function acquireAuthCode(
         }
         let text: string;
         try {
-          text = await callbacks.onPrompt({
-            message: promptMessage,
-            placeholder: "http://localhost:51121/oauth-callback?state=…&code=…",
-          });
+          text = await Promise.race([
+            onPrompt({
+              message: promptMessage,
+              placeholder: "http://localhost:51121/oauth-callback?state=…&code=…",
+            }),
+            ...abortSignals.map(promptAborted),
+          ]);
         } catch (err: unknown) {
           // Prompt/transport failure — propagate, do not retry.
           throw err instanceof Error ? err : new Error(String(err));
