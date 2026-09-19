@@ -8,6 +8,16 @@ entries here describe this plugin's OMP line only.
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-09-20
+
+### Added
+
+- **Visual health indicators:** render dynamic traffic-light colors (green $\ge$ 50%, yellow 20%–49%, red < 20%, bold red 0%) for quota percentages and Unicode block progress bars (`█` / `░`) in TUI/TTY environments.
+
+### Changed
+
+- **Chronological quota display:** order quota windows naturally with short-term limits (`5h` / `Daily`) shown before long-term limits (`Weekly`).
+
 ## [0.8.1] - 2026-09-20
 
 ### Changed
