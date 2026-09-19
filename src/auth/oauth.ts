@@ -2,7 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@oh-my-pi/pi-ai";
 import { defaultProjectId, loadCodeAssist } from "../client/client.js";
-import { antigravityFetch } from "../utils/http.js";
+import { antigravityFetch, withDeadline } from "../utils/http.js";
 import { escapeHtml, antigravityEnv } from "../utils/util.js";
 import { resolveCallbackHost, redactSecrets } from "../utils/security.js";
 import type { AntigravityOAuthCredentials, CallbackServer } from "../types/types.js";
@@ -11,6 +11,12 @@ export const REDIRECT_URI = "http://localhost:51121/oauth-callback";
 export const AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 export const TOKEN_URL = "https://oauth2.googleapis.com/token";
 export const OAUTH_CALLBACK_TIMEOUT_MS = 5 * 60 * 1000;
+/**
+ * Deadline for the Google OAuth endpoints themselves. Without it a stalled
+ * token exchange would leave `/login` hanging with no way to tell it apart from
+ * a user still typing in the browser.
+ */
+export const OAUTH_HTTP_TIMEOUT_MS = 30 * 1000;
 export const SCOPES = [
   "https://www.googleapis.com/auth/aicode",
   "https://www.googleapis.com/auth/cloud-platform",
@@ -82,6 +88,7 @@ async function getUserEmail(token: string): Promise<string | undefined> {
   try {
     const res = await antigravityFetch("https://www.googleapis.com/oauth2/v1/userinfo?alt=json", {
       headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(OAUTH_HTTP_TIMEOUT_MS),
     });
     if (!res.ok) return undefined;
     const data = (await res.json()) as { email?: string };
@@ -371,7 +378,7 @@ export async function loginAntigravity(
     });
     if (returnedState !== state) throw new Error("OAuth state mismatch");
 
-    const tokenResponse = await fetch(TOKEN_URL, {
+    const tokenResponse = await antigravityFetch(TOKEN_URL, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
@@ -382,6 +389,7 @@ export async function loginAntigravity(
         redirect_uri: REDIRECT_URI,
         code_verifier: verifier,
       }).toString(),
+      signal: withDeadline(OAUTH_HTTP_TIMEOUT_MS, callbacks.signal),
     });
     if (!tokenResponse.ok) {
       throw new Error(
@@ -401,14 +409,14 @@ export async function loginAntigravity(
 
     const [fetchedEmail, discoveredProject] = await Promise.all([
       getUserEmail(tokenData.access_token),
-      loadCodeAssist(tokenData.access_token),
+      loadCodeAssist(tokenData.access_token, callbacks.signal),
     ]);
     const email = fetchedEmail || deriveFallbackEmail(tokenData.refresh_token);
     return {
       refresh: tokenData.refresh_token,
       access: tokenData.access_token,
       expires: Date.now() + tokenData.expires_in * 1000 - 5 * 60 * 1000,
-      projectId: discoveredProject || defaultProjectId(email),
+      projectId: discoveredProject || defaultProjectId(),
       email,
     };
   } finally {
@@ -419,7 +427,7 @@ export async function loginAntigravity(
 export async function refreshAntigravityToken(
   credentials: OAuthCredentials,
 ): Promise<AntigravityOAuthCredentials> {
-  const response = await fetch(TOKEN_URL, {
+  const response = await antigravityFetch(TOKEN_URL, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
@@ -428,6 +436,7 @@ export async function refreshAntigravityToken(
       refresh_token: credentials.refresh,
       grant_type: "refresh_token",
     }).toString(),
+    signal: AbortSignal.timeout(OAUTH_HTTP_TIMEOUT_MS),
   });
   if (!response.ok) {
     throw new Error(
@@ -450,16 +459,16 @@ export async function refreshAntigravityToken(
     refresh: data.refresh_token || credentials.refresh,
     access: data.access_token,
     expires: Date.now() + data.expires_in * 1000 - 5 * 60 * 1000,
-    projectId: existingProjectId || discoveredProject || defaultProjectId(email),
+    projectId: existingProjectId || discoveredProject || defaultProjectId(),
     email,
   };
 }
 
 export function getApiKey(credentials: OAuthCredentials): string {
-  const email = credentialEmail(credentials);
   return JSON.stringify({
     token: credentials.access,
-    projectId: credentialProjectId(credentials) || defaultProjectId(email || "antigravity-default"),
+    projectId: credentialProjectId(credentials) || defaultProjectId(),
+    email: credentialEmail(credentials),
   });
 }
 

@@ -1,7 +1,7 @@
 import type { ProviderModelConfig } from "@oh-my-pi/pi-coding-agent";
 import type { AntigravityRouting, ThinkingWire } from "../types/types.js";
 import { ThinkingEffort } from "../types/enums.js";
-import type { AntigravityCatalog } from "./grouping.js";
+import { buildThinkingMetadata, type AntigravityCatalog } from "./grouping.js";
 import { setWithCap } from "../utils/util.js";
 
 export const PROVIDER_ID = "antigravity";
@@ -173,83 +173,15 @@ const claudeSonnetCost = { input: 3.0, output: 15.0, cacheRead: 0.3, cacheWrite:
 const claudeOpusCost = { input: 15.0, output: 75.0, cacheRead: 1.5, cacheWrite: 18.75 };
 const gptOssCost = { input: 0.6, output: 2.4, cacheRead: 0.15, cacheWrite: 0.6 };
 
-/**
- * OMP's canonical thinking metadata for one public model.
- *
- * `ProviderModelConfig` has no `thinkingLevelMap` field — that was a pi-era field
- * which OMP silently ignores, leaving each model's selectable efforts to OMP's
- * model-id heuristics. Declaring `thinking` instead makes the catalog
- * self-describing and gives OMP two things it cannot infer:
- *
- * - `efforts`: the levels the `/thinking` menu offers and the set OMP clamps a
- *   requested effort against (`clampThinkingLevelForModel`). A reasoning model
- *   with no `thinking.efforts` is treated as having no controllable effort
- *   surface, so the level the user picks would never reach this provider.
- * - `effortRouting`: the per-effort upstream wire id. OMP builds a reverse index
- *   from it so a collapsed variant id (`antigravity/gemini-3.8-flash-high`) still
- *   resolves to this public model.
- *
- * `mode: "budget"` matches what this provider actually emits on the wire:
- * `generationConfig.thinkingConfig.thinkingBudget`.
- *
- * `suppressWhenOff` states the Cloud Code Assist requirement explicitly: when
- * thinking is off this provider sends `thinkingBudget: 0` rather than omitting
- * `thinkingConfig`, because the backend re-applies the per-runtime-id baked
- * server default when the config is absent.
- */
-type AntigravityThinking = NonNullable<ProviderModelConfig["thinking"]>;
-
-/**
- * OMP's effort vocabulary, mirroring `@oh-my-pi/pi-catalog/effort`'s
- * `THINKING_EFFORTS` ladder. Spelled out as literals because OMP declares
- * `Effort` as a `const enum`, which an extension cannot import as a value under
- * `isolatedModules`.
- *
- * Because `Effort` is a `const enum`, a member's type (`Effort.Low`) is a
- * distinct enum-literal type that a plain `"low"` does not satisfy. The two
- * `as` casts in {@link antigravityThinking} are the only places that lean on the
- * two vocabularies agreeing, so both need the runtime ladder to stay in sync
- * with `THINKING_EFFORTS`.
- */
-type ThinkingLevel = "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
-
-function antigravityThinking(
-  routing: AntigravityRouting,
-  efforts: readonly ThinkingLevel[],
-  effortBudgets: Partial<Record<ThinkingLevel, number>>,
-): AntigravityThinking {
-  const effortRouting: Record<string, string> = {};
-  if (routing.off) effortRouting.off = routing.off;
-  for (const effort of efforts) {
-    // `ThinkingEffort` mirrors pi's `Effort` minus "max", and no routing table
-    // defines "max"; the cast only lets the wider pi union index the table.
-    const wireId = routing.routing?.[effort as ThinkingEffort];
-    if (wireId) effortRouting[effort] = wireId;
-  }
-  return {
-    mode: "budget",
-    efforts: [...efforts] as AntigravityThinking["efforts"],
-    defaultLevel: efforts[0] as AntigravityThinking["defaultLevel"],
-    effortRouting,
-    effortBudgets: effortBudgets,
-    suppressWhenOff: true,
-  };
-}
-
 /** Same set as `agy models`, collapsed to public OMP model IDs. */
 export const ANTIGRAVITY_MODELS: ProviderModelConfig[] = [
   {
     id: "gemini-3.8-flash",
     name: "Gemini 3.8 Flash (Antigravity)",
     reasoning: true,
-    thinking: antigravityThinking(
-      ANTIGRAVITY_ROUTING["gemini-3.8-flash"],
+    thinking: buildThinkingMetadata(
       ["low", "medium", "high"],
-      {
-        low: 1000,
-        medium: 4000,
-        high: -1,
-      },
+      ANTIGRAVITY_ROUTING["gemini-3.8-flash"],
     ),
     input: ["text", "image"],
     cost: geminiFlashCost,
@@ -260,14 +192,9 @@ export const ANTIGRAVITY_MODELS: ProviderModelConfig[] = [
     id: "gemini-3.7-flash",
     name: "Gemini 3.7 Flash (Antigravity)",
     reasoning: true,
-    thinking: antigravityThinking(
-      ANTIGRAVITY_ROUTING["gemini-3.7-flash"],
+    thinking: buildThinkingMetadata(
       ["low", "medium", "high"],
-      {
-        low: 1000,
-        medium: 4000,
-        high: -1,
-      },
+      ANTIGRAVITY_ROUTING["gemini-3.7-flash"],
     ),
     input: ["text", "image"],
     cost: geminiFlashCost,
@@ -278,14 +205,9 @@ export const ANTIGRAVITY_MODELS: ProviderModelConfig[] = [
     id: "gemini-3.6-flash",
     name: "Gemini 3.6 Flash (Antigravity)",
     reasoning: true,
-    thinking: antigravityThinking(
-      ANTIGRAVITY_ROUTING["gemini-3.6-flash"],
+    thinking: buildThinkingMetadata(
       ["low", "medium", "high"],
-      {
-        low: 1000,
-        medium: 4000,
-        high: -1,
-      },
+      ANTIGRAVITY_ROUTING["gemini-3.6-flash"],
     ),
     input: ["text", "image"],
     cost: geminiFlashCost,
@@ -296,7 +218,7 @@ export const ANTIGRAVITY_MODELS: ProviderModelConfig[] = [
     id: "claude-opus-4-6",
     name: "Claude Opus 4.6 (Antigravity)",
     reasoning: true,
-    thinking: antigravityThinking(ANTIGRAVITY_ROUTING["claude-opus-4-6"], ["high"], { high: 1024 }),
+    thinking: buildThinkingMetadata(["high"], ANTIGRAVITY_ROUTING["claude-opus-4-6"]),
     input: ["text", "image"],
     cost: claudeOpusCost,
     contextWindow: 250000,
@@ -306,9 +228,7 @@ export const ANTIGRAVITY_MODELS: ProviderModelConfig[] = [
     id: "claude-sonnet-4-6",
     name: "Claude Sonnet 4.6 (Antigravity)",
     reasoning: true,
-    thinking: antigravityThinking(ANTIGRAVITY_ROUTING["claude-sonnet-4-6"], ["high"], {
-      high: 1024,
-    }),
+    thinking: buildThinkingMetadata(["high"], ANTIGRAVITY_ROUTING["claude-sonnet-4-6"]),
     input: ["text", "image"],
     cost: claudeSonnetCost,
     contextWindow: 200000,
@@ -318,10 +238,7 @@ export const ANTIGRAVITY_MODELS: ProviderModelConfig[] = [
     id: "gemini-3.1-pro",
     name: "Gemini 3.1 Pro (Antigravity)",
     reasoning: true,
-    thinking: antigravityThinking(ANTIGRAVITY_ROUTING["gemini-3.1-pro"], ["low", "high"], {
-      low: 1001,
-      high: 10001,
-    }),
+    thinking: buildThinkingMetadata(["low", "high"], ANTIGRAVITY_ROUTING["gemini-3.1-pro"]),
     input: ["text", "image"],
     cost: geminiProCost,
     contextWindow: 1048576,
@@ -331,14 +248,9 @@ export const ANTIGRAVITY_MODELS: ProviderModelConfig[] = [
     id: "gemini-3.5-flash",
     name: "Gemini 3.5 Flash (Antigravity)",
     reasoning: true,
-    thinking: antigravityThinking(
-      ANTIGRAVITY_ROUTING["gemini-3.5-flash"],
+    thinking: buildThinkingMetadata(
       ["low", "medium", "high"],
-      {
-        low: 1000,
-        medium: 4000,
-        high: 10000,
-      },
+      ANTIGRAVITY_ROUTING["gemini-3.5-flash"],
     ),
     input: ["text", "image"],
     cost: geminiFlashCost,
@@ -349,9 +261,7 @@ export const ANTIGRAVITY_MODELS: ProviderModelConfig[] = [
     id: "gpt-oss-120b",
     name: "GPT-OSS 120B (Antigravity)",
     reasoning: true,
-    thinking: antigravityThinking(ANTIGRAVITY_ROUTING["gpt-oss-120b"], ["medium"], {
-      medium: 8192,
-    }),
+    thinking: buildThinkingMetadata(["medium"], ANTIGRAVITY_ROUTING["gpt-oss-120b"]),
     input: ["text"],
     cost: gptOssCost,
     contextWindow: 131072,
@@ -365,19 +275,27 @@ const MAX_PROJECT_CATALOGS = 64;
 const MAX_MODEL_ENUMS = 64;
 const catalogsByProject = new Map<string, AntigravityCatalog>();
 
-export function getCurrentAntigravityRouting(): Record<string, AntigravityRouting> {
-  return currentRouting;
-}
-
 export function getCurrentAntigravityCatalog(): AntigravityCatalog {
   return { models: currentModels, routing: currentRouting };
 }
 
-export function getAntigravityCatalogForProject(projectId?: string): AntigravityCatalog {
-  if (projectId && catalogsByProject.has(projectId)) {
-    return catalogsByProject.get(projectId)!;
+/**
+ * Routing entry for one model, resolved account-first.
+ *
+ * A scoped lookup may use only that account's discovered catalog or the static
+ * fallback. The merged catalog exists for model listing, not request routing:
+ * using it here would leak another account's runtime ids into this request.
+ */
+function routingFor(modelId: string, projectId?: string): AntigravityRouting | undefined {
+  if (projectId) {
+    return catalogsByProject.get(projectId)?.routing[modelId] ?? ANTIGRAVITY_ROUTING[modelId];
   }
-  return { models: currentModels, routing: currentRouting };
+  return currentRouting[modelId] ?? ANTIGRAVITY_ROUTING[modelId];
+}
+
+/** Whether this model has a routing entry for the given account. */
+export function hasAntigravityRouting(modelId: string, projectId?: string): boolean {
+  return routingFor(modelId, projectId) !== undefined;
 }
 
 export function applyAntigravityCatalog(catalog: AntigravityCatalog, projectId?: string): void {
@@ -397,9 +315,7 @@ export function getAntigravityRequestModelId(
   effort: string | undefined,
   projectId?: string,
 ): string {
-  const projectCatalog = projectId ? catalogsByProject.get(projectId) : undefined;
-  const r =
-    projectCatalog?.routing[modelId] ?? currentRouting[modelId] ?? ANTIGRAVITY_ROUTING[modelId];
+  const r = routingFor(modelId, projectId);
   if (!r) return modelId;
 
   if (effort === undefined || effort === "off") {
@@ -407,10 +323,11 @@ export function getAntigravityRequestModelId(
   }
 
   const effortKey = effort as ThinkingEffort;
-  if (effortKey === ThinkingEffort.Xhigh) {
+  if (effort === "max" || effortKey === ThinkingEffort.Xhigh) {
     return (
       r.routing?.xhigh ??
       r.routing?.high ??
+      r.routing?.medium ??
       r.routing?.low ??
       r.routing?.minimal ??
       r.off ??
@@ -493,83 +410,64 @@ const ANTIGRAVITY_MODEL_ENUM: Record<string, string> = {
   "gpt-oss-120b-medium": "MODEL_OPENAI_GPT_OSS_120B_MEDIUM",
 };
 
-const modelEnumCache = new Map<string, string>();
+const unscopedModelEnumCache = new Map<string, string>();
+const modelEnumsByProject = new Map<string, Map<string, string>>();
 
-/** Register dynamically discovered model enum (e.g. from fetchAvailableModels). */
-export function registerModelEnum(wireModelId: string, modelEnum: string): void {
+function modelEnumCacheFor(projectId: string | undefined): Map<string, string> {
+  if (!projectId) return unscopedModelEnumCache;
+  const existing = modelEnumsByProject.get(projectId);
+  if (existing) {
+    setWithCap(modelEnumsByProject, projectId, existing, MAX_PROJECT_CATALOGS);
+    return existing;
+  }
+  const created = new Map<string, string>();
+  setWithCap(modelEnumsByProject, projectId, created, MAX_PROJECT_CATALOGS);
+  return created;
+}
+
+/** Register a dynamically discovered model enum in its account scope. */
+export function registerModelEnum(
+  wireModelId: string,
+  modelEnum: string,
+  projectId?: string,
+): void {
   if (wireModelId && modelEnum) {
-    setWithCap(modelEnumCache, wireModelId, modelEnum, MAX_MODEL_ENUMS);
+    setWithCap(modelEnumCacheFor(projectId), wireModelId, modelEnum, MAX_MODEL_ENUMS);
   }
 }
 
-/** Register batch of discovered model enums from fetchAvailableModels raw models dictionary. */
+/** Register a discovered enum batch in its account scope. */
 export function registerDiscoveredModelEnums(
   models: Record<string, { model?: unknown }> | undefined,
+  projectId?: string,
 ): void {
   if (!models) return;
+  const cache = modelEnumCacheFor(projectId);
   for (const [wireId, info] of Object.entries(models)) {
     if (typeof info?.model === "string" && info.model) {
-      setWithCap(modelEnumCache, wireId, info.model, MAX_MODEL_ENUMS);
+      setWithCap(cache, wireId, info.model, MAX_MODEL_ENUMS);
     }
   }
 }
 
-/** Get model_enum label for a given wire model id (dynamic cache first, then static fallback). */
+/** Get the model_enum label without consulting another account's dynamic cache. */
 export function getModelEnum(wireModelId: string, projectId?: string): string | undefined {
-  const direct = modelEnumCache.get(wireModelId) || ANTIGRAVITY_MODEL_ENUM[wireModelId];
+  const cache = projectId ? modelEnumsByProject.get(projectId) : unscopedModelEnumCache;
+  const direct = cache?.get(wireModelId) ?? ANTIGRAVITY_MODEL_ENUM[wireModelId];
   if (direct) return direct;
 
-  // Runtime overrides may name a public/base model while discovery only returned
-  // an enum for its selected runtime variant (for example `-low`). Scoped to the
-  // caller's project so another account's catalog cannot leak into the label.
   const routed = getAntigravityRequestModelId(wireModelId, undefined, projectId);
-  return modelEnumCache.get(routed) || ANTIGRAVITY_MODEL_ENUM[routed];
+  return cache?.get(routed) ?? ANTIGRAVITY_MODEL_ENUM[routed];
 }
 
 export function getThinkingConfig(
-  modelId: string,
   effort: string | undefined,
   budgets?: Partial<Record<string, number>>,
 ): ThinkingWire | undefined {
-  const config = defaultThinkingConfig(modelId, effort);
-  if (!config || !effort || effort === "off") return config;
-  // OMP's documented precedence for token-based providers is caller `thinkingBudgets`
-  // first, then the model's baked budget, then the provider ladder.
-  const override = budgets?.[effort];
-  if (typeof override !== "number" || !Number.isFinite(override)) return config;
-  return { includeThoughts: true, thinkingBudget: override };
-}
-
-function defaultThinkingConfig(
-  modelId: string,
-  effort: string | undefined,
-): ThinkingWire | undefined {
-  if (modelId.startsWith("claude-")) {
-    if (!effort || effort === "off") return { includeThoughts: false, thinkingBudget: 0 };
-    return { includeThoughts: true, thinkingBudget: 1024 };
+  if (!effort || effort === "off") {
+    return { includeThoughts: false, thinkingBudget: 0 };
   }
-  if (modelId.startsWith("gpt-oss-")) {
-    if (!effort || effort === "off") return { includeThoughts: false, thinkingBudget: 0 };
-    return { includeThoughts: true, thinkingBudget: 8192 };
-  }
-  if (modelId.startsWith("gemini-3.5-flash") || modelId === "gemini-3-flash-agent") {
-    if (!effort || effort === "off") return { includeThoughts: false, thinkingBudget: 0 };
-    const thinkingBudget =
-      effort === "high" || effort === "xhigh" ? 10_000 : effort === "medium" ? 4_000 : 1_000;
-    return { includeThoughts: true, thinkingBudget };
-  }
-  if (modelId.startsWith("gemini-3.1-pro") || modelId === "gemini-pro-agent") {
-    if (!effort || effort === "off") return { includeThoughts: false, thinkingBudget: 0 };
-    return {
-      includeThoughts: true,
-      thinkingBudget: effort === "high" || effort === "xhigh" ? 10_001 : 1_001,
-    };
-  }
-  if (modelId.startsWith("gemini-")) {
-    if (!effort || effort === "off") return { includeThoughts: false, thinkingBudget: 0 };
-    const thinkingBudget =
-      effort === "high" || effort === "xhigh" ? -1 : effort === "medium" ? 4_000 : 1_000;
-    return { includeThoughts: true, thinkingBudget };
-  }
-  return undefined;
+  const budget = budgets?.[effort];
+  if (typeof budget !== "number" || !Number.isFinite(budget)) return undefined;
+  return { includeThoughts: true, thinkingBudget: budget };
 }

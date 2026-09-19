@@ -10,13 +10,15 @@ import type {
 import type { ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
 import {
   AntigravityHttpError,
+  DISCOVERY_TIMEOUT_MS,
   extractProjectId,
   fetchAvailableModelsCatalog,
+  fetchCodeAssistMetadata,
   parseApiKey,
   postAntigravityJson,
   resolveProjectId,
 } from "../client/client.js";
-import { setLastError, setLastProjectId } from "../diagnostics/diagnostics.js";
+import { setLastAccountId, setLastError, setLastProjectId } from "../diagnostics/diagnostics.js";
 import { isRecord } from "../utils/util.js";
 import { safeError } from "../utils/security.js";
 import { PROVIDER_ID } from "../models/models.js";
@@ -152,18 +154,7 @@ function parseTier(value: unknown): TierInfo | undefined {
 
 async function loadCodeAssistSafe(token: string, signal?: AbortSignal) {
   try {
-    return await postAntigravityJson(
-      "/v1internal:loadCodeAssist",
-      token,
-      {
-        metadata: {
-          ideType: "ANTIGRAVITY",
-          platform: "PLATFORM_UNSPECIFIED",
-          pluginType: "GEMINI",
-        },
-      },
-      { signal },
-    );
+    return await fetchCodeAssistMetadata(token, signal);
   } catch {
     return null;
   }
@@ -192,7 +183,7 @@ async function fetchQuotaSummarySafe(
         "/v1internal:retrieveUserQuotaSummary",
         token,
         {},
-        { signal },
+        { signal, timeoutMs: DISCOVERY_TIMEOUT_MS },
       ),
     };
   } catch (error) {
@@ -219,10 +210,10 @@ export async function fetchAccountUsage(
 ): Promise<AccountUsage> {
   const signal = options?.signal;
   const creds = parseApiKey(apiKeyRaw);
+  setLastAccountId(creds.email);
   const initialProjectId =
     creds.projectId ||
     resolveProjectId({
-      token: creds.token,
       credentialProjectId: creds.projectId,
     });
 
@@ -237,7 +228,6 @@ export async function fetchAccountUsage(
   // Derive project ID from the loadCodeAssist response or stored project ID.
   const discoveredProject = assistResult ? extractProjectId(assistResult.data) : undefined;
   const projectId = resolveProjectId({
-    token: creds.token,
     warmedProject: discoveredProject ?? null,
     credentialProjectId: creds.projectId,
   });
@@ -548,7 +538,11 @@ export const antigravityUsageProvider: UsageProvider = {
     if (!token) return null;
     try {
       const usage = await fetchAccountUsage(
-        JSON.stringify({ token, projectId: params.credential.projectId ?? "" }),
+        JSON.stringify({
+          token,
+          projectId: params.credential.projectId ?? "",
+          email: params.credential.email,
+        }),
         { signal: params.signal },
       );
       return buildUsageReport(usage);

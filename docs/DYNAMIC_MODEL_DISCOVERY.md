@@ -22,8 +22,10 @@ newly launched model can appear in OMP without a plugin release.
    applies explicit aliases where a runtime id does not share its family's suffix
    (`gemini-pro-agent` → `gemini-3.1-pro` high), merges `*-agent` singletons into their family, and
    reads back the advertised thinking levels.
-5. `applyAntigravityCatalog` swaps the live catalog in, and `fetchDynamicModels` returns its models to
-   OMP.
+5. `discoverAntigravityModels` returns the catalog **together with the project id it resolved**, so
+   `applyAntigravityCatalog(catalog, projectId)` can bucket the routing table under that account even
+   in the bare-token case where the caller cannot read the credential's project id itself.
+   `fetchDynamicModels` then returns the catalog's models to OMP.
 6. Models present in the conservative static table but missing from an account's live catalog stay
    selectable, which is what keeps a free-tier account working.
 

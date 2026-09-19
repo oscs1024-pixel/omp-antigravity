@@ -5,12 +5,25 @@ import {
   parseApiKey,
 } from "../client/index.js";
 import { buildAntigravityCatalog, type AntigravityCatalog } from "./grouping.js";
-import { ANTIGRAVITY_MODELS, ANTIGRAVITY_ROUTING, registerDiscoveredModelEnums } from "./models.js";
+import { ANTIGRAVITY_MODELS, ANTIGRAVITY_ROUTING } from "./models.js";
 
 const fallbackCatalog = (): AntigravityCatalog => ({
   models: ANTIGRAVITY_MODELS,
   routing: { ...ANTIGRAVITY_ROUTING },
 });
+
+/**
+ * Result of one discovery pass.
+ *
+ * `projectId` is the account the catalog belongs to. OMP only ever hands
+ * `fetchDynamicModels` a bare access token, so the project id has to be resolved
+ * here; returning it is what lets the caller bucket the catalog per account
+ * instead of applying it to the shared routing table.
+ */
+export type AntigravityDiscovery = {
+  catalog: AntigravityCatalog;
+  projectId: string;
+};
 
 /**
  * Discover the live Antigravity model catalog.
@@ -24,14 +37,14 @@ const fallbackCatalog = (): AntigravityCatalog => ({
 export async function discoverAntigravityModels(
   apiKey: string,
   signal?: AbortSignal,
-): Promise<AntigravityCatalog> {
+): Promise<AntigravityDiscovery> {
   const creds = parseApiKey(apiKey);
-  const projectId = creds.projectId || (await loadCodeAssist(creds.token)) || defaultProjectId();
+  const projectId =
+    creds.projectId || (await loadCodeAssist(creds.token, signal)) || defaultProjectId();
   const available = await fetchAvailableModelsCatalog(creds.token, projectId, signal);
   const models = available.data.models;
   if (!models || Object.keys(models).length === 0) {
-    return { models: [], routing: {} };
+    return { catalog: { models: [], routing: {} }, projectId };
   }
-  registerDiscoveredModelEnums(models);
-  return buildAntigravityCatalog(models, fallbackCatalog());
+  return { catalog: buildAntigravityCatalog(models, fallbackCatalog()), projectId };
 }

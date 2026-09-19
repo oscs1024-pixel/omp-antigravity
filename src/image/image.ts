@@ -1,4 +1,4 @@
-import { lstat, mkdir, realpath, writeFile } from "node:fs/promises";
+import { mkdir, realpath } from "node:fs/promises";
 import { dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   AntigravityHttpError,
@@ -9,12 +9,13 @@ import {
   jsonOrTextError,
   loadCodeAssist,
   parseApiKey,
+  recordSuccessfulEndpoint,
 } from "../client/client.js";
 import { ProviderHttpError } from "@oh-my-pi/pi-ai/error";
 import { AntigravityRequestType, AntigravityUserAgent, GeminiRole } from "../types/enums.js";
 import { streamChunkError } from "../stream/errors.js";
-import { antigravityFetch } from "../utils/http.js";
-import { safeError } from "../utils/security.js";
+import { antigravityFetch, withDeadline } from "../utils/http.js";
+import { safeError, writePrivateFileNoFollow } from "../utils/security.js";
 import { antigravityRequestEnvelope, sanitizeText } from "../utils/util.js";
 
 export const DEFAULT_IMAGE_MODEL = "gemini-3-pro-image";
@@ -37,6 +38,14 @@ const IMAGE_MODEL_FALLBACKS = [
   "gemini-3.1-flash-image",
   "gemini-3-pro-image-preview",
 ];
+/**
+ * Deadline for one image-generation attempt, covering the whole SSE body.
+ *
+ * The slash-command path passes no signal at all, so without this a stalled
+ * endpoint would leave `/antigravity.image` hanging forever. Image models are
+ * slow but not two-minutes-slow for a single frame.
+ */
+const IMAGE_REQUEST_TIMEOUT_MS = 120_000;
 const IMAGE_SYSTEM_INSTRUCTION =
   "You are an AI image generator. Generate images based on user descriptions. Focus on creating high-quality, visually appealing images that match the user's request.";
 /**
@@ -101,6 +110,13 @@ type ImageStreamChunk = {
     };
   }>;
 };
+
+class ImageSaveError extends Error {
+  constructor(cause: unknown) {
+    super(`Image save failed: ${safeError(cause)}`, { cause });
+    this.name = "ImageSaveError";
+  }
+}
 
 function imageExtension(mimeType: string): string {
   const lower = mimeType.toLowerCase();
@@ -291,22 +307,9 @@ async function writeImage(cwd: string, filePath: string, image: GeneratedImage):
   if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
     throw new Error("Image save path escapes the working directory (symlink traversal).");
   }
-  // Refuse to overwrite an existing symlink — a link at the final path could
-  // redirect the write to an arbitrary destination even when ancestors are clean.
-  try {
-    const stat = await lstat(realTarget);
-    if (stat.isSymbolicLink()) {
-      throw new Error("Refusing to write through a symbolic link.");
-    }
-  } catch (e: unknown) {
-    // ENOENT is expected for a new file; rethrow anything else.
-    if (e instanceof Error && "code" in e && (e as NodeJS.ErrnoException).code === "ENOENT") {
-      // file does not exist yet — safe
-    } else {
-      throw e;
-    }
-  }
-  await writeFile(realTarget, Buffer.from(image.data, "base64"));
+  // Open the already-resolved final path without following a link swapped into
+  // place between validation and write.
+  await writePrivateFileNoFollow(realTarget, Buffer.from(image.data, "base64"));
   return filePath;
 }
 
@@ -320,26 +323,33 @@ export async function generateAntigravityImage(
   }
   const aspectRatio = assertSafeAspectRatio(options.aspectRatio || "1:1");
   const preferred = assertSafeImageModel(options.model || DEFAULT_IMAGE_MODEL);
+  // Path containment is independent of the generated MIME type. Reject invalid
+  // user input before spending any image-generation quota.
+  resolveImageSavePath(options.cwd, options.path);
   const models = [preferred, ...IMAGE_MODEL_FALLBACKS.filter((id) => id !== preferred)];
   const creds = parseApiKey(options.apiKey);
   // Bare-token credentials (OMP peekApiKey form) carry no project id —
   // discover it the same way the streaming path does.
   const projectId = creds.projectId || (await loadCodeAssist(creds.token)) || defaultProjectId();
   const headers = antigravityHeaders(creds.token);
+  const endpoints = endpointCandidates();
 
   let lastError = "no endpoint available";
   for (const model of models) {
     const body = JSON.stringify(buildImageGenerateRequest(prompt, model, projectId, aspectRatio));
-    for (const endpoint of endpointCandidates()) {
+    for (const endpoint of endpoints) {
       if (options.signal?.aborted) throw new Error("Request was aborted");
       try {
+        // One deadline per attempt: each endpoint/model candidate gets its own
+        // budget rather than sharing a single exhausted one.
+        const signal = withDeadline(IMAGE_REQUEST_TIMEOUT_MS, options.signal);
         const response = await antigravityFetch(
           `${endpoint}/v1internal:streamGenerateContent?alt=sse`,
           {
             method: "POST",
             headers,
             body,
-            signal: options.signal,
+            signal,
           },
         );
         if (!response.ok) {
@@ -351,29 +361,35 @@ export async function generateAntigravityImage(
           // on another endpoint or image model — abort the fan-out entirely.
           throw new AntigravityHttpError(safeError(lastError), response.status, endpoint);
         }
-        const parsed = await collectImagesFromSse(response, options.signal);
+        const parsed = await collectImagesFromSse(response, signal);
         if (!parsed.images.length) {
           lastError = parsed.text.join(" ").trim() || "No image data returned.";
           continue;
         }
+        recordSuccessfulEndpoint(endpoint);
         const savedPaths: string[] = [];
         const many = parsed.images.length > 1;
-        for (const [index, image] of parsed.images.entries()) {
-          savedPaths.push(
-            await writeImage(
-              options.cwd,
-              resolveImageSavePath(
+        try {
+          for (const [index, image] of parsed.images.entries()) {
+            savedPaths.push(
+              await writeImage(
                 options.cwd,
-                options.path,
-                image.mimeType,
-                many ? index : undefined,
+                resolveImageSavePath(
+                  options.cwd,
+                  options.path,
+                  image.mimeType,
+                  many ? index : undefined,
+                ),
+                image,
               ),
-              image,
-            ),
-          );
+            );
+          }
+        } catch (error) {
+          throw new ImageSaveError(error);
         }
         return { images: parsed.images, savedPaths, text: parsed.text, model };
       } catch (error) {
+        if (error instanceof ImageSaveError) throw error;
         if (options.signal?.aborted) {
           throw new Error("Request was aborted", { cause: error });
         }

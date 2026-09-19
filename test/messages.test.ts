@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type { AssistantMessage, Context, Model, Api, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import { convertMessages } from "../src/stream/messages.js";
+import { CONTINUATION_TEXT } from "../src/stream/constants.js";
 import { clearSessionTrajectoryMap, resolveSessionTrajectory } from "../src/utils/util.js";
 
 const claudeModel = {
@@ -83,6 +84,31 @@ describe("convertMessages empty toolCallId pairing", () => {
       const match = responses.find((r) => r.name === call.name);
       assert.equal(match?.id, call.id, `${call.name} response must reuse its call id`);
     }
+  });
+});
+
+describe("convertMessages continuation bridge", () => {
+  it("adds one trailing user bridge for model-only compacted history", () => {
+    const context = {
+      messages: [
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "Prior answer" }],
+          stopReason: "stop",
+          timestamp: 1,
+        },
+      ],
+    } as unknown as Context;
+
+    const contents = convertMessages(claudeModel, context, "claude-sonnet-4-6");
+    assert.deepEqual(
+      contents.map((turn) => turn.role),
+      ["model", "user"],
+    );
+    const bridges = contents
+      .flatMap((turn) => turn.parts)
+      .filter((part) => "text" in part && part.text === CONTINUATION_TEXT);
+    assert.equal(bridges.length, 1);
   });
 });
 

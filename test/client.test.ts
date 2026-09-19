@@ -2,10 +2,17 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   AntigravityHttpError,
+  AntigravityAccountIneligibleError,
   buildModelMatchRegex,
+  endpointCandidates,
+  fetchAvailableModelsCatalog,
+  hasProvisionedTier,
   isRetryableEndpointStatus,
   loadCodeAssist,
+  onboardUser,
   postAntigravityJson,
+  recordSuccessfulEndpoint,
+  resetEndpointPreferenceForTests,
   type PostJsonResponse,
 } from "../src/client/client.js";
 
@@ -225,6 +232,67 @@ describe("postAntigravityJson retry policy", () => {
   });
 });
 
+describe("catalog endpoint failures", () => {
+  const originalFetch = globalThis.fetch;
+
+  it("surfaces the real endpoint error when every catalog request fails", async () => {
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls++;
+      return new Response(JSON.stringify({ error: { message: "VALIDATION_REQUIRED" } }), {
+        status: 403,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as typeof fetch;
+
+    try {
+      await assert.rejects(
+        () => fetchAvailableModelsCatalog("catalog-failure-token", "project"),
+        (error: unknown) => {
+          assert.ok(error instanceof AntigravityHttpError);
+          assert.equal(error.status, 403);
+          assert.match(error.message, /VALIDATION_REQUIRED/);
+          return true;
+        },
+      );
+      assert.equal(calls, endpointCandidates().length);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("keeps the selected endpoint after parallel discovery completes", async () => {
+    resetEndpointPreferenceForTests();
+    const candidates = endpointCandidates();
+    recordSuccessfulEndpoint(candidates[1]!);
+    const selected = endpointCandidates()[0];
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ models: {} }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })) as typeof fetch;
+
+    try {
+      await fetchAvailableModelsCatalog("catalog-priority-token", "project");
+      assert.equal(endpointCandidates()[0], selected);
+    } finally {
+      globalThis.fetch = originalFetch;
+      resetEndpointPreferenceForTests();
+    }
+  });
+});
+
+describe("endpoint preference", () => {
+  it("moves the last successful fallback endpoint to the front", () => {
+    resetEndpointPreferenceForTests();
+    const endpoints = endpointCandidates();
+    assert.ok(endpoints.length > 1);
+    recordSuccessfulEndpoint(endpoints[1]!);
+    assert.equal(endpointCandidates()[0], endpoints[1]);
+    resetEndpointPreferenceForTests();
+  });
+});
+
 describe("loadCodeAssist project cache", () => {
   const originalFetch = globalThis.fetch;
 
@@ -247,6 +315,145 @@ describe("loadCodeAssist project cache", () => {
     try {
       assert.equal(await loadCodeAssist("transient-failure-token"), undefined);
       assert.equal(await loadCodeAssist("transient-failure-token"), "recovered-project");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+describe("free-tier onboarding", () => {
+  const originalFetch = globalThis.fetch;
+  const jsonResponse = (body: unknown, status = 200): Response =>
+    new Response(JSON.stringify(body), {
+      status,
+      headers: { "Content-Type": "application/json" },
+    });
+
+  it("reads a missing currentTier as unprovisioned", () => {
+    assert.equal(hasProvisionedTier({ currentTier: { id: "free-tier" } }), true);
+    assert.equal(hasProvisionedTier({ currentTier: null }), false);
+    assert.equal(hasProvisionedTier({ cloudaicompanionProject: "project" }), false);
+    assert.equal(hasProvisionedTier(undefined), false);
+  });
+
+  it("polls the onboardUser operation until it reports done", async () => {
+    const requests: string[] = [];
+    globalThis.fetch = (async (input: string | URL, init?: RequestInit) => {
+      requests.push(`${init?.method ?? "GET"} ${String(input)}`);
+      if (requests.length === 1) {
+        return jsonResponse({ name: "operations/onboard-1", done: false });
+      }
+      return jsonResponse({
+        name: "operations/onboard-1",
+        done: true,
+        response: { cloudaicompanionProject: "project" },
+      });
+    }) as typeof fetch;
+
+    try {
+      await onboardUser("onboard-poll-token");
+      assert.equal(requests.length, 2);
+      assert.equal(
+        requests[0],
+        "POST https://daily-cloudcode-pa.googleapis.com/v1internal:onboardUser",
+      );
+      assert.equal(
+        requests[1],
+        "GET https://daily-cloudcode-pa.googleapis.com/v1internal/operations/onboard-1",
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("throws when the operation reports an error", async () => {
+    globalThis.fetch = (async () =>
+      jsonResponse({
+        name: "operations/onboard-2",
+        done: true,
+        error: { code: 7, message: "PERMISSION_DENIED" },
+      })) as typeof fetch;
+
+    try {
+      await assert.rejects(
+        () => onboardUser("onboard-error-token"),
+        /onboardUser failed: 7: PERMISSION_DENIED/,
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("provisions before reading the project when currentTier is absent", async () => {
+    const loadCodeAssistCalls: number[] = [];
+    const sawOnboard: string[] = [];
+    globalThis.fetch = (async (input: string | URL) => {
+      const url = String(input);
+      if (url.includes("onboardUser")) {
+        sawOnboard.push(url);
+        return jsonResponse({
+          name: "operations/onboard-3",
+          done: true,
+          response: { cloudaicompanionProject: "project" },
+        });
+      }
+      loadCodeAssistCalls.push(loadCodeAssistCalls.length + 1);
+      return loadCodeAssistCalls.length === 1
+        ? jsonResponse({ allowedTiers: [{ id: "free-tier" }] })
+        : jsonResponse({
+            currentTier: { id: "free-tier" },
+            cloudaicompanionProject: "provisioned-project",
+          });
+    }) as typeof fetch;
+
+    try {
+      assert.equal(await loadCodeAssist("onboarding-token"), "provisioned-project");
+      assert.equal(sawOnboard.length, 1, "onboarding must run before the project is re-read");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("does not onboard or enumerate projects for an explicitly ineligible tier", async () => {
+    const requests: string[] = [];
+    globalThis.fetch = (async (input: string | URL) => {
+      requests.push(String(input));
+      return jsonResponse({
+        ineligibleTiers: [
+          {
+            id: "free-tier",
+            reasonMessage: "Account verification is required.",
+            validationUrl: "https://accounts.google.com/verify",
+          },
+        ],
+      });
+    }) as typeof fetch;
+
+    try {
+      await assert.rejects(
+        () => loadCodeAssist("ineligible-tier-token"),
+        (error: unknown) => {
+          assert.ok(error instanceof AntigravityAccountIneligibleError);
+          assert.match(error.message, /Account verification is required/);
+          assert.match(error.message, /https:\/\/accounts\.google\.com\/verify/);
+          return true;
+        },
+      );
+      assert.equal(requests.length, 1);
+      assert.match(requests[0]!, /loadCodeAssist/);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("keeps the project loadCodeAssist already returned when onboarding fails", async () => {
+    globalThis.fetch = (async (input: string | URL) =>
+      String(input).includes("onboardUser")
+        ? jsonResponse({ error: { message: "PERMISSION_DENIED" } }, 403)
+        : jsonResponse({ cloudaicompanionProject: "existing-project" })) as typeof fetch;
+
+    try {
+      assert.equal(await loadCodeAssist("onboarding-failure-token"), "existing-project");
     } finally {
       globalThis.fetch = originalFetch;
     }

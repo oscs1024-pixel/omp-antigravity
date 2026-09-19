@@ -7,6 +7,7 @@ export type DiagnosticsSnapshot = {
   endpoint?: string;
   error?: string;
   projectId?: string;
+  accountId?: string;
   resolvedRuntimeModel?: string;
   availableModels?: string;
   matchedModelDebug?: string;
@@ -18,8 +19,8 @@ const storage = new AsyncLocalStorage<DiagnosticsSnapshot>();
 
 /** Last completed request snapshot for `/antigravity.doctor`. */
 let lastSnapshot: DiagnosticsSnapshot = {};
-const MAX_PROJECT_SNAPSHOTS = 64;
-const snapshotsByProject = new Map<string, DiagnosticsSnapshot>();
+const MAX_SCOPED_SNAPSHOTS = 64;
+const snapshotsByScope = new Map<string, DiagnosticsSnapshot>();
 
 function currentBag(): DiagnosticsSnapshot {
   return storage.getStore() ?? lastSnapshot;
@@ -33,18 +34,19 @@ export async function runWithDiagnostics<T>(fn: () => Promise<T>): Promise<T> {
       return await fn();
     } finally {
       lastSnapshot = { ...bag };
-      if (bag.projectId) {
-        setWithCap(snapshotsByProject, bag.projectId, { ...bag }, MAX_PROJECT_SNAPSHOTS);
+      const scope = bag.accountId || bag.projectId;
+      if (scope) {
+        setWithCap(snapshotsByScope, scope, { ...bag }, MAX_SCOPED_SNAPSHOTS);
       }
     }
   });
 }
 
-export function getLastDiagnostics(projectId?: string): Readonly<DiagnosticsSnapshot> {
-  if (projectId) {
+export function getLastDiagnostics(scope?: string): Readonly<DiagnosticsSnapshot> {
+  if (scope) {
     // A known account with no snapshot returns empty rather than another
-    // account's last request — doctor output stays scoped to its own project.
-    return snapshotsByProject.get(projectId) ?? {};
+    // account's last request.
+    return snapshotsByScope.get(scope) ?? {};
   }
   return lastSnapshot;
 }
@@ -74,6 +76,9 @@ export function setLastError(error: string | undefined): void {
 export function setLastProjectId(projectId: string | undefined): void {
   currentBag().projectId = projectId;
 }
+export function setLastAccountId(accountId: string | undefined): void {
+  currentBag().accountId = accountId;
+}
 export function setLastResolvedRuntimeModel(model: string | undefined): void {
   currentBag().resolvedRuntimeModel = model;
 }
@@ -96,5 +101,5 @@ export function setLastToolSchemaWarnings(warnings: string[] | undefined): void 
 /** Test helper: reset last snapshot between cases. */
 export function resetDiagnosticsForTests(): void {
   lastSnapshot = {};
-  snapshotsByProject.clear();
+  snapshotsByScope.clear();
 }

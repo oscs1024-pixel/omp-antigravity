@@ -12,11 +12,14 @@ type ThinkingLevel = ThinkingEffort;
 type RuntimeGroup = {
   publicId: string;
   variants: Partial<Record<ThinkingLevel, string>>;
+  variantPriorities: Partial<Record<ThinkingLevel, number>>;
   unsuffixed?: string;
   displayNames: string[];
   /** Catalog capability: true/false when advertised, undefined when omitted. */
   supportsThinking?: boolean;
   supportsImages?: boolean;
+  contextWindow?: number;
+  maxOutputTokens?: number;
 };
 
 const THINKING_SUFFIXES: Array<{ suffix: string; level: ThinkingLevel }> = [
@@ -112,7 +115,7 @@ export function buildAntigravityCatalog(
     absorbMetadata(group, info, displayName);
 
     const level = alias?.level ?? levelFromDisplayName(displayName) ?? suffix?.level;
-    if (level) group.variants[level] = runtimeId;
+    if (level) assignVariant(group, level, runtimeId, displayName);
     else group.unsuffixed = runtimeId;
   }
 
@@ -124,14 +127,6 @@ export function buildAntigravityCatalog(
   const routing: Record<string, AntigravityRouting> = {};
 
   for (const group of groups.values()) {
-    const fallbackModel = fallback.models.find((model) => model.id === group.publicId);
-    const fallbackRouting = fallback.routing[group.publicId];
-    if (fallbackModel && fallbackRouting) {
-      models.push(fallbackModel);
-      routing[group.publicId] = fallbackRouting;
-      continue;
-    }
-
     const synthesized = synthesizeModel(group, fallback.models);
     models.push(synthesized.model);
     routing[group.publicId] = synthesized.routing;
@@ -155,10 +150,41 @@ function ensureGroup(groups: Map<string, RuntimeGroup>, publicId: string): Runti
   const created: RuntimeGroup = {
     publicId,
     variants: {},
+    variantPriorities: {},
     displayNames: [],
   };
   groups.set(publicId, created);
   return created;
+}
+
+function assignVariant(
+  group: RuntimeGroup,
+  level: ThinkingLevel,
+  runtimeId: string,
+  displayName: string | undefined,
+): void {
+  const canonicalSuffix: Partial<Record<ThinkingLevel, string>> = {
+    [ThinkingEffort.Minimal]: "minimal",
+    [ThinkingEffort.Low]: "low",
+    [ThinkingEffort.Medium]: "medium",
+    [ThinkingEffort.High]: "high",
+    [ThinkingEffort.Xhigh]: "extra-high",
+  };
+  const suffix = canonicalSuffix[level];
+  const priority =
+    (suffix && runtimeId === `${group.publicId}-${suffix}` ? 4 : 0) +
+    (levelFromDisplayName(displayName) === level ? 2 : 0) +
+    (RUNTIME_ALIASES[runtimeId]?.level === level ? 1 : 0);
+  const current = group.variants[level];
+  const currentPriority = group.variantPriorities[level] ?? -1;
+  if (
+    !current ||
+    priority > currentPriority ||
+    (priority === currentPriority && runtimeId.localeCompare(current) < 0)
+  ) {
+    group.variants[level] = runtimeId;
+    group.variantPriorities[level] = priority;
+  }
 }
 
 function absorbMetadata(
@@ -171,9 +197,36 @@ function absorbMetadata(
   else if (info?.supportsThinking === false && group.supportsThinking !== true) {
     group.supportsThinking = false;
   }
-  if (info?.supportsImages === true) group.supportsImages = true;
-  if (info?.supportsImages === false && group.supportsImages === undefined) {
-    group.supportsImages = false;
+  if (typeof info?.supportsImages === "boolean") {
+    group.supportsImages = (group.supportsImages ?? true) && info.supportsImages;
+  }
+  const contextWindow =
+    typeof info?.maxTokens === "number" && Number.isFinite(info.maxTokens) && info.maxTokens > 0
+      ? info.maxTokens
+      : undefined;
+  if (contextWindow !== undefined) {
+    group.contextWindow =
+      group.contextWindow === undefined
+        ? contextWindow
+        : Math.min(group.contextWindow, contextWindow);
+  }
+  const maxOutputTokens =
+    typeof info?.maxOutputTokens === "number" &&
+    Number.isFinite(info.maxOutputTokens) &&
+    info.maxOutputTokens > 0
+      ? info.maxOutputTokens
+      : undefined;
+  if (maxOutputTokens !== undefined) {
+    group.maxOutputTokens =
+      group.maxOutputTokens === undefined
+        ? maxOutputTokens
+        : Math.min(group.maxOutputTokens, maxOutputTokens);
+  }
+  if (
+    (typeof info?.thinkingBudget === "number" && Number.isFinite(info.thinkingBudget)) ||
+    (typeof info?.minThinkingBudget === "number" && Number.isFinite(info.minThinkingBudget))
+  ) {
+    group.supportsThinking = true;
   }
 }
 
@@ -189,9 +242,19 @@ function mergeAgentSingletons(groups: Map<string, RuntimeGroup>): void {
         candidate.displayNames.some((name) => displayFamily(name) === family),
     );
     if (!target || !group.unsuffixed) continue;
-    const level = levelFromDisplayName(group.displayNames[0]) ?? ThinkingEffort.High;
-    target.variants[level] = group.unsuffixed;
-    absorbMetadata(target, { supportsThinking: group.supportsThinking }, group.displayNames[0]);
+    const displayName = group.displayNames[0];
+    const level = levelFromDisplayName(displayName) ?? ThinkingEffort.High;
+    assignVariant(target, level, group.unsuffixed, displayName);
+    absorbMetadata(
+      target,
+      {
+        supportsThinking: group.supportsThinking,
+        supportsImages: group.supportsImages,
+        maxTokens: group.contextWindow,
+        maxOutputTokens: group.maxOutputTokens,
+      },
+      displayName,
+    );
     groups.delete(publicId);
   }
 }
@@ -249,11 +312,11 @@ function synthesizeModel(
       id: group.publicId,
       name: publicModelName(group),
       reasoning,
-      thinking: thinkingConfigFromLevels(advertisedLevels, routing),
+      thinking: buildThinkingMetadata(advertisedLevels, routing),
       input: supportsImages ? ["text", "image"] : ["text"],
       cost: template?.cost ?? ZERO_COST,
-      contextWindow: template?.contextWindow ?? 128000,
-      maxTokens: template?.maxTokens ?? 8192,
+      contextWindow: group.contextWindow ?? template?.contextWindow ?? 128000,
+      maxTokens: group.maxOutputTokens ?? template?.maxTokens ?? 8192,
     },
     routing,
   };
@@ -361,11 +424,12 @@ export function routingFromVariants(
  */
 type AntigravityThinking = NonNullable<ProviderModelConfig["thinking"]>;
 
-function thinkingConfigFromLevels(
-  levels: Set<string>,
+export function buildThinkingMetadata(
+  levels: Iterable<string>,
   routing: AntigravityRouting,
 ): AntigravityThinking | undefined {
-  const efforts = OMP_EFFORTS.filter((level) => levels.has(level));
+  const available = new Set(levels);
+  const efforts = OMP_EFFORTS.filter((level) => available.has(level));
   if (efforts.length === 0) return undefined;
 
   const effortRouting: Record<string, string> = {};
@@ -393,6 +457,8 @@ function familyTemplate(
   publicId: string,
   fallbackModels: ProviderModelConfig[],
 ): ProviderModelConfig | undefined {
+  const exact = fallbackModels.find((model) => model.id === publicId);
+  if (exact) return exact;
   if (/^gemini-.*-flash/i.test(publicId)) {
     return fallbackModels.find((model) => /^gemini-.*-flash/i.test(model.id));
   }
@@ -420,7 +486,11 @@ function familyTemplate(
 function publicModelName(group: RuntimeGroup): string {
   const family = group.displayNames.map((name) => displayFamily(name)).find(Boolean);
   if (family) {
-    return `${titleCase(family)} (Antigravity)`;
+    const publicVersion = group.publicId.match(/\d+/g)?.join(".");
+    const displayVersion = family.match(/\d+/g)?.join(".");
+    if (!publicVersion || !displayVersion || publicVersion === displayVersion) {
+      return `${titleCase(family)} (Antigravity)`;
+    }
   }
   return `${humanizePublicId(group.publicId)} (Antigravity)`;
 }

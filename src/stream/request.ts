@@ -122,17 +122,6 @@ export function buildRequest(
   systemParts.push(...injectedSkills.map((skill) => ({ text: sanitizeText(skill) })));
 
   const contents = convertMessages(model, context, runtimeModel);
-  const hasUserText = contents.some(
-    (turn) =>
-      turn.role === GeminiRole.User &&
-      turn.parts.some((part) => "text" in part && Boolean(part.text.trim())),
-  );
-  if (!hasUserText && (injectedSkills.length > 0 || systemPromptText)) {
-    contents.unshift({
-      role: GeminiRole.User,
-      parts: [{ text: "Apply the active system instructions." }],
-    });
-  }
 
   const request: GeminiRequestBody = {
     contents,
@@ -144,11 +133,7 @@ export function buildRequest(
 
   const generationConfig: GeminiGenerationConfig = {};
   if (options.temperature !== undefined) generationConfig.temperature = options.temperature;
-  const thinking = getThinkingConfig(
-    runtimeModel,
-    resolveRequestedEffort(options),
-    options.thinkingBudgets,
-  );
+  const thinking = getThinkingConfig(resolveRequestedEffort(options), options.thinkingBudgets);
   if (thinking) generationConfig.thinkingConfig = thinking;
   const maxAllowed = getMaxOutputTokens(model.id, runtimeModel);
   if (options.maxTokens !== undefined) {
@@ -159,7 +144,8 @@ export function buildRequest(
   if (Object.keys(generationConfig).length) request.generationConfig = generationConfig;
 
   const isClaude = model.id.startsWith("claude-") || runtimeModel.startsWith("claude-");
-  const tools = convertTools(context.tools, isClaude || model.id.startsWith("gpt-oss-"));
+  const isGptOss = model.id.startsWith("gpt-oss-") || runtimeModel.startsWith("gpt-oss-");
+  const tools = convertTools(context.tools, isClaude || isGptOss);
   if (tools) {
     request.tools = tools;
     if (options.toolChoice) {
@@ -192,8 +178,7 @@ export function buildRequest(
   }
   const isNonGemini =
     isClaude ||
-    model.id.startsWith("gpt-oss-") ||
-    runtimeModel.startsWith("gpt-oss-") ||
+    isGptOss ||
     (!model.id.startsWith("gemini-") && !runtimeModel.startsWith("gemini-"));
 
   // Pure agy CLI wire alignment:

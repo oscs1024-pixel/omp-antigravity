@@ -8,6 +8,15 @@ type HostCalculateCost = (
   timestamp?: number,
 ) => UsageCost;
 
+/**
+ * Host cost helper, when one is reachable.
+ *
+ * `@oh-my-pi/pi-ai` does not export `calculateCost` itself: inside OMP this
+ * module specifier is rewritten to the host's legacy pi-ai shim, which does
+ * (`pi-coding-agent/src/extensibility/legacy-pi-ai-shim.ts`). When the plugin is
+ * loaded standalone — the scripts under `scripts/` — the lookup is `undefined`
+ * and {@link calculateFlatRateCost} prices the turn with the same arithmetic.
+ */
 const hostCalculateCost: HostCalculateCost | undefined = piAiRuntime.calculateCost;
 
 export function calculateFlatRateCost(

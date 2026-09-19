@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from "node:crypto";
+import { createHash } from "node:crypto";
 import { getModelEnum } from "../models/models.js";
 
 export function antigravityEnv(name: string): string | undefined {
@@ -81,40 +81,6 @@ export type AntigravityEnvelopeOptions = {
   projectId?: string;
 };
 
-const INT63_MASK = (1n << 63n) - 1n;
-const ANTIGRAVITY_RANDOM_BOUND = 9_000_000_000_000_000_000n;
-
-export function formatSignedDecimalSessionId(value: bigint): string {
-  return `-${value.toString()}`;
-}
-
-export function deriveSignedDecimalFromHash(text: string): string {
-  const digest = createHash("sha256").update(text).digest();
-  let value = 0n;
-  for (let index = 0; index < 8; index += 1) {
-    value = (value << 8n) | BigInt(digest[index] ?? 0);
-  }
-  return formatSignedDecimalSessionId(value & INT63_MASK);
-}
-
-function randomBoundedInt63(maxExclusive: bigint): bigint {
-  while (true) {
-    const bytes = randomBytes(8);
-    let value = 0n;
-    for (const byte of bytes) {
-      value = (value << 8n) | BigInt(byte);
-    }
-    value &= INT63_MASK;
-    if (value < maxExclusive) {
-      return value;
-    }
-  }
-}
-
-export function randomSignedDecimalSessionId(): string {
-  return formatSignedDecimalSessionId(randomBoundedInt63(ANTIGRAVITY_RANDOM_BOUND));
-}
-
 export type SessionTrajectoryEntry = {
   conversationId: string;
   trajectoryId: string;
@@ -137,7 +103,7 @@ export function resolveSessionTrajectory(
     return {
       conversationId: crypto.randomUUID(),
       trajectoryId: crypto.randomUUID(),
-      sessionId: randomSignedDecimalSessionId(),
+      sessionId: crypto.randomUUID(),
     };
   }
   // Hash the full first message (and system prompt) rather than truncating: two
@@ -157,22 +123,10 @@ export function resolveSessionTrajectory(
   const seed = contentSeed;
   let entry = sessionTrajectoryMap.get(seed);
   if (!entry) {
-    let rawText = "";
-    if (typeof firstMsg.content === "string") {
-      rawText = firstMsg.content;
-    } else if (Array.isArray(firstMsg.content)) {
-      const parts = firstMsg.content as unknown[];
-      const firstPart = parts[0];
-      if (isRecord(firstPart) && typeof firstPart.text === "string") {
-        rawText = firstPart.text;
-      }
-    }
     entry = {
       conversationId: stableUuid(`antigravity:conv:${seed}`),
       trajectoryId: stableUuid(`antigravity:traj:${seed}`),
-      sessionId: rawText.trim()
-        ? deriveSignedDecimalFromHash(rawText)
-        : randomSignedDecimalSessionId(),
+      sessionId: stableUuid(`antigravity:session:${seed}`),
     };
     setWithCap(sessionTrajectoryMap, seed, entry, 64);
   }
@@ -207,7 +161,7 @@ export function antigravityRequestEnvelope(
   const requestIndex = options.requestIndex ?? options.userTurnIndex ?? Math.max(0, step - 1);
   const agentId = options.conversationId || crypto.randomUUID();
   const trajectoryId = options.trajectoryId || crypto.randomUUID();
-  const sessionId = options.sessionId || randomSignedDecimalSessionId();
+  const sessionId = options.sessionId || crypto.randomUUID();
 
   const claudeLabel = isClaude ? "true" : "false";
   const nonGeminiLabel = isNonGemini ? "true" : "false";

@@ -7,6 +7,7 @@ import {
   type AntigravityCatalog,
 } from "../src/models/grouping.js";
 import { ThinkingEffort } from "../src/types/enums.js";
+import { applyAntigravityCatalog, getAntigravityRequestModelId } from "../src/models/models.js";
 
 describe("parseThinkingSuffix", () => {
   it("correctly parses low suffix", () => {
@@ -162,6 +163,96 @@ describe("buildAntigravityCatalog", () => {
     assert.equal(routing.routing?.low, "gemini-3.9-flash-low");
     assert.equal(routing.routing?.medium, "gemini-3.9-flash-medium");
     assert.equal(routing.routing?.high, "gemini-3.9-flash-high");
+  });
+
+  it("uses advertised limits and disambiguates a mismatched display family", () => {
+    const catalog = buildAntigravityCatalog(
+      {
+        "gemini-4-1-flash-low": {
+          displayName: "Gemini 3.9 Flash (Low)",
+          maxTokens: 2_000_000,
+          maxOutputTokens: 123_456,
+          supportsThinking: false,
+          thinkingBudget: 512,
+        },
+      },
+      fallback,
+    );
+    const model = catalog.models.find((entry) => entry.id === "gemini-4-1-flash");
+    assert.ok(model);
+    assert.equal(model.name, "Gemini 4.1 Flash (Antigravity)");
+    assert.equal(model.contextWindow, 2_000_000);
+    assert.equal(model.maxTokens, 123_456);
+    assert.equal(model.reasoning, true);
+  });
+
+  it("merges live static-family routing with conservative shared capabilities", () => {
+    const catalog = buildAntigravityCatalog(
+      {
+        "gemini-3.1-pro-low": {
+          displayName: "Gemini 3.1 Pro (Low)",
+          maxTokens: 100_000,
+          maxOutputTokens: 1_000,
+          supportsImages: false,
+        },
+        "gemini-3.1-pro-high": {
+          displayName: "Gemini 3.1 Pro (High)",
+          maxTokens: 200_000,
+          maxOutputTokens: 2_000,
+          supportsImages: true,
+        },
+      },
+      {
+        ...fallback,
+        routing: {
+          "gemini-3.1-pro": {
+            off: "stale-static-low",
+            routing: {
+              [ThinkingEffort.Low]: "stale-static-low",
+              [ThinkingEffort.High]: "stale-static-high",
+            },
+            defaultRequestId: "stale-static-low",
+          },
+        },
+      },
+    );
+
+    const model = catalog.models.find((entry) => entry.id === "gemini-3.1-pro");
+    assert.ok(model);
+    assert.equal(model.contextWindow, 100_000);
+    assert.equal(model.maxTokens, 1_000);
+    assert.deepEqual(model.input, ["text"]);
+    assert.equal(catalog.routing["gemini-3.1-pro"]?.routing?.low, "gemini-3.1-pro-low");
+    assert.equal(catalog.routing["gemini-3.1-pro"]?.routing?.high, "gemini-3.1-pro-high");
+  });
+
+  it("resolves colliding low aliases deterministically", () => {
+    const entries = [
+      ["gemini-4-2-flash-extra-low", { displayName: "Gemini 4.2 Flash (Extra Low)" }],
+      ["gemini-4-2-flash-low", { displayName: "Gemini 4.2 Flash (Low)" }],
+    ] as const;
+    const forward = buildAntigravityCatalog(Object.fromEntries(entries), fallback);
+    const reverse = buildAntigravityCatalog(Object.fromEntries([...entries].reverse()), fallback);
+    assert.equal(forward.routing["gemini-4-2-flash"]?.routing?.low, "gemini-4-2-flash-low");
+    assert.equal(reverse.routing["gemini-4-2-flash"]?.routing?.low, "gemini-4-2-flash-low");
+  });
+
+  it("routes max and xhigh to the highest available tier", () => {
+    const catalog = buildAntigravityCatalog(
+      {
+        "gemini-9-9-flash-medium": { displayName: "Gemini 9.9 Flash (Medium)" },
+      },
+      fallback,
+    );
+    applyAntigravityCatalog(catalog, "max-routing-project");
+    assert.equal(
+      getAntigravityRequestModelId("gemini-9-9-flash", "max", "max-routing-project"),
+      "gemini-9-9-flash-medium",
+    );
+    assert.equal(
+      getAntigravityRequestModelId("gemini-9-9-flash", "xhigh", "max-routing-project"),
+      "gemini-9-9-flash-medium",
+    );
   });
 
   it("merges agent singletons into their canonical parent family", () => {

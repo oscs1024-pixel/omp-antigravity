@@ -7,6 +7,7 @@ import {
   getLastDiagnostics,
   resetDiagnosticsForTests,
   runWithDiagnostics,
+  setLastAccountId,
   setLastError,
   setLastProjectId,
   setLastStatus,
@@ -15,8 +16,10 @@ import {
   applyAntigravityCatalog,
   getAntigravityRequestModelId,
   getModelEnum,
+  hasAntigravityRouting,
   registerModelEnum,
 } from "../src/models/models.js";
+import { discoverAntigravityModels } from "../src/models/discovery.js";
 import { ThinkingEffort } from "../src/types/enums.js";
 import type { AccountUsage } from "../src/types/types.js";
 import { formatAccountQuotaSummary } from "../src/usage/usage.js";
@@ -94,6 +97,15 @@ describe("dynamic model enum cache", () => {
 
     assert.equal(getModelEnum("dynamic-cap-test-0"), undefined);
     assert.equal(getModelEnum("dynamic-cap-test-64"), "DYNAMIC_CAP_TEST_64");
+  });
+
+  it("does not expose one project's discovered enum to another project", () => {
+    registerModelEnum("shared-runtime", "ENUM_A", "enum-project-A");
+    registerModelEnum("shared-runtime", "ENUM_B", "enum-project-B");
+
+    assert.equal(getModelEnum("shared-runtime", "enum-project-A"), "ENUM_A");
+    assert.equal(getModelEnum("shared-runtime", "enum-project-B"), "ENUM_B");
+    assert.equal(getModelEnum("shared-runtime", "enum-project-C"), undefined);
   });
 });
 
@@ -187,6 +199,100 @@ describe("applyAntigravityCatalog per-project routing", () => {
   });
 });
 
+describe("hasAntigravityRouting account scope", () => {
+  it("uses only the account catalog and static fallback for scoped routing", () => {
+    applyAntigravityCatalog(
+      {
+        models: [],
+        routing: {
+          "gemini-scope-probe": {
+            off: "runtime-probe-low",
+            routing: { [ThinkingEffort.High]: "runtime-probe-high" },
+            defaultRequestId: "runtime-probe-low",
+          },
+        },
+      },
+      "project-scope-probe",
+    );
+
+    // The account's own bucket.
+    assert.equal(hasAntigravityRouting("gemini-scope-probe", "project-scope-probe"), true);
+    // Another account must not inherit this dynamic route through the merged UI catalog.
+    assert.equal(hasAntigravityRouting("gemini-scope-probe", "project-without-a-catalog"), false);
+    // Static catalog.
+    assert.equal(hasAntigravityRouting("gemini-3.1-pro", "project-without-a-catalog"), true);
+    // Unknown everywhere.
+    assert.equal(hasAntigravityRouting("gemini-not-a-real-model", "project-scope-probe"), false);
+  });
+
+  it("agrees with the routing decision for an account-only model", () => {
+    applyAntigravityCatalog(
+      {
+        models: [],
+        routing: {
+          "gemini-account-only": {
+            off: "runtime-account-low",
+            routing: { [ThinkingEffort.High]: "runtime-account-high" },
+            defaultRequestId: "runtime-account-low",
+          },
+        },
+      },
+      "project-account-only",
+    );
+
+    assert.equal(hasAntigravityRouting("gemini-account-only", "project-account-only"), true);
+    assert.equal(
+      getAntigravityRequestModelId(
+        "gemini-account-only",
+        ThinkingEffort.High,
+        "project-account-only",
+      ),
+      "runtime-account-high",
+      "a known model must route to a runtime id",
+    );
+  });
+});
+
+describe("discoverAntigravityModels account key", () => {
+  const originalFetch = globalThis.fetch;
+  const jsonResponse = (body: unknown): Response =>
+    new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+
+  it("returns the project id it resolved so callers can bucket the catalog", async () => {
+    // OMP hands fetchDynamicModels a bare access token, never the stored
+    // credential, so the project id has to travel back with the catalog or the
+    // per-account routing bucket can never be written.
+    globalThis.fetch = (async (input: string | URL) =>
+      String(input).includes("loadCodeAssist")
+        ? jsonResponse({
+            currentTier: { id: "free-tier" },
+            cloudaicompanionProject: "project-from-bare-token",
+          })
+        : jsonResponse({
+            models: {
+              "gemini-3.9-flash-low": {
+                displayName: "Gemini 3.9 Flash (Low)",
+                supportsThinking: true,
+              },
+            },
+          })) as typeof fetch;
+
+    try {
+      const discovered = await discoverAntigravityModels("bare-access-token");
+      assert.equal(discovered.projectId, "project-from-bare-token");
+      assert.ok(
+        discovered.catalog.models.some((model) => model.id === "gemini-3.9-flash"),
+        "the discovered family must be folded into a public model id",
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
 describe("diagnostics per-project scoping", () => {
   it("stores and retrieves diagnostics scoped to projectId", async () => {
     resetDiagnosticsForTests();
@@ -212,6 +318,25 @@ describe("diagnostics per-project scoping", () => {
     assert.equal(diagB.projectId, "project-B");
     assert.equal(diagB.status, 429);
     assert.equal(diagB.error, "Quota reached");
+  });
+
+  it("isolates accounts that share the same project id", async () => {
+    resetDiagnosticsForTests();
+
+    await runWithDiagnostics(async () => {
+      setLastAccountId("first@example.com");
+      setLastProjectId("shared-project");
+      setLastStatus(200);
+    });
+    await runWithDiagnostics(async () => {
+      setLastAccountId("second@example.com");
+      setLastProjectId("shared-project");
+      setLastStatus(403);
+    });
+
+    assert.equal(getLastDiagnostics("first@example.com").status, 200);
+    assert.equal(getLastDiagnostics("second@example.com").status, 403);
+    assert.deepEqual(getLastDiagnostics("missing@example.com"), {});
   });
 });
 
@@ -332,6 +457,34 @@ describe("formatAccountQuotaSummary", () => {
     assert.ok(summary.startsWith("Plan: Google AI Pro (g1-pro-tier)\n"));
     assert.ok(summary.includes("Account verification required:"));
     assert.ok(summary.includes("https://accounts.google.com/signin/continue"));
+  });
+});
+
+describe("extension registration", () => {
+  it("does not fail registration when ANTIGRAVITY_BASE_URL is invalid", () => {
+    const previous = process.env.ANTIGRAVITY_BASE_URL;
+    process.env.ANTIGRAVITY_BASE_URL = "http://untrusted.example.test";
+    const dummyNode: Record<string, unknown> = {};
+    dummyNode.describe = () => dummyNode;
+    dummyNode.optional = () => dummyNode;
+    const mockPi = {
+      setLabel: () => {},
+      zod: {
+        object: () => dummyNode,
+        string: () => dummyNode,
+        enum: () => dummyNode,
+      },
+      registerProvider: () => {},
+      registerCommand: () => {},
+      registerTool: () => {},
+    } as unknown as ExtensionAPI;
+
+    try {
+      assert.doesNotThrow(() => registerExtension(mockPi));
+    } finally {
+      if (previous === undefined) delete process.env.ANTIGRAVITY_BASE_URL;
+      else process.env.ANTIGRAVITY_BASE_URL = previous;
+    }
   });
 });
 

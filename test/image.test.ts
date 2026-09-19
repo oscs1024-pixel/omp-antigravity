@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { resolveImageSavePath } from "../src/image/image.js";
+import { generateAntigravityImage, resolveImageSavePath } from "../src/image/image.js";
 
 const CWD = "/tmp/agy-img-test";
 
@@ -24,5 +24,32 @@ describe("resolveImageSavePath", () => {
   it("honours an explicit file path and appends index suffixes", () => {
     const p = resolveImageSavePath(CWD, "out/pic.png", "image/png", 1);
     assert.equal(p, `${CWD}/out/pic-2.png`);
+  });
+});
+
+describe("generateAntigravityImage input validation", () => {
+  it("rejects an escaping output path before making a generation request", async () => {
+    const originalFetch = globalThis.fetch;
+    let requests = 0;
+    globalThis.fetch = (async () => {
+      requests++;
+      throw new Error("network must not be reached");
+    }) as typeof fetch;
+
+    try {
+      await assert.rejects(
+        () =>
+          generateAntigravityImage({
+            prompt: "A test image",
+            path: "../escape.png",
+            cwd: CWD,
+            apiKey: JSON.stringify({ token: "token", projectId: "project" }),
+          }),
+        /inside the working directory/,
+      );
+      assert.equal(requests, 0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });

@@ -103,10 +103,14 @@ function readGenerateImageParams(value: unknown): ImageCommandArgs {
 export default function (pi: ExtensionAPI): void {
   pi.setLabel("Antigravity");
 
-  // Open the TLS connection up front so the first message of a session does not pay
-  // the handshake. Opt out with ANTIGRAVITY_NO_PREWARM=1.
-  const primaryEndpoint = endpointCandidates()[0];
-  if (primaryEndpoint) prewarmConnection(primaryEndpoint);
+  // Prewarming is opportunistic. Configuration errors remain request-time
+  // errors and must not prevent the extension from registering its commands.
+  try {
+    const primaryEndpoint = endpointCandidates()[0];
+    if (primaryEndpoint) prewarmConnection(primaryEndpoint);
+  } catch {
+    // Invalid ANTIGRAVITY_BASE_URL is reported when the provider is used.
+  }
 
   // OMP injects a Zod-compatible schema builder; the docs recommend it over the
   // legacy TypeBox `Type` helper for new tool schemas.
@@ -136,14 +140,17 @@ export default function (pi: ExtensionAPI): void {
       if (!apiKey) {
         throw new Error("Antigravity credentials not available yet. Run /login antigravity first.");
       }
-      const creds = parseApiKey(apiKey);
-      const projectId = creds.projectId || undefined;
       const discovered = await discoverAntigravityModels(apiKey);
-      if (discovered.models.length === 0) {
+      if (discovered.catalog.models.length === 0) {
         throw new Error("Antigravity model discovery returned no selectable models");
       }
-      const next = resolvedCatalog(discovered, getCurrentAntigravityCatalog());
-      applyAntigravityCatalog(next, projectId);
+      const next = resolvedCatalog(discovered.catalog, getCurrentAntigravityCatalog());
+      // Bucket under the project discovery resolved for this account. OMP hands
+      // this callback a bare access token, so the credential's own project id is
+      // not readable here — without using the discovered one the per-account
+      // routing table documented in docs/DYNAMIC_MODEL_DISCOVERY.md stays empty
+      // and every account shares one last-writer-wins routing table.
+      applyAntigravityCatalog(next, discovered.projectId);
       return next.models;
     },
     oauth: {
@@ -249,69 +256,108 @@ export default function (pi: ExtensionAPI): void {
       const hasExplicitActive = accounts.some((a) => a.active);
       const titleSuffix = hasExplicitActive ? "" : " (no pin — host auto-selects)";
       const lines: string[] = [`Antigravity Accounts (${accounts.length} stored${titleSuffix})`];
-      const accountRows = await Promise.all(
-        accounts.map(async (acc) => {
-          const num = `#${acc.position + 1}`;
-          const statusDot = acc.active ? (useColor ? "\x1b[32m●\x1b[0m" : "●") : "○";
-          const tag = acc.active ? (useColor ? " \x1b[32m[ACTIVE]\x1b[0m" : " [ACTIVE]") : "";
-          const emailLabel = acc.email || "(no email)";
-          const header = `  ${statusDot} ${num}: ${emailLabel}${tag}`;
-          const projectLine = `      Project: ${acc.projectId || "unknown"}`;
-          try {
-            let accessToken: string | undefined;
-            let projectId: string | undefined = acc.projectId;
+      const accountIdentity = (acc: (typeof accounts)[number]) => {
+        const num = `#${acc.position + 1}`;
+        const statusDot = acc.active ? (useColor ? "\x1b[32m●\x1b[0m" : "●") : "○";
+        const tag = acc.active ? (useColor ? " \x1b[32m[ACTIVE]\x1b[0m" : " [ACTIVE]") : "";
+        return {
+          header: `  ${statusDot} ${num}: ${acc.email || "(no email)"}${tag}`,
+          projectLine: `      Project: ${acc.projectId || "unknown"}`,
+        };
+      };
+      const inspectAccount = async (acc: (typeof accounts)[number]): Promise<string> => {
+        const { header, projectLine } = accountIdentity(acc);
+        try {
+          let accessToken: string | undefined;
+          let projectId: string | undefined = acc.projectId;
 
-            // Try reading cached access token from snapshot if still fresh (avoids redundant refresh)
-            if (typeof authStorage.exportSnapshot === "function") {
-              try {
-                const snapshot = authStorage.exportSnapshot();
-                const match = snapshot?.credentials?.find(
-                  (c) => c.id === acc.credentialId && c.provider === PROVIDER_ID,
-                );
-                if (match && match.credential.type === "oauth") {
-                  const cred = match.credential;
-                  if (
-                    typeof cred.access === "string" &&
-                    cred.access &&
-                    typeof cred.expires === "number" &&
-                    Date.now() + 60_000 < cred.expires
-                  ) {
-                    accessToken = cred.access;
-                    if (cred.projectId) projectId = cred.projectId;
-                  }
+          // Try reading cached access token from snapshot if still fresh (avoids redundant refresh)
+          if (typeof authStorage.exportSnapshot === "function") {
+            try {
+              const snapshot = authStorage.exportSnapshot();
+              const match = snapshot?.credentials?.find(
+                (c) => c.id === acc.credentialId && c.provider === PROVIDER_ID,
+              );
+              if (match && match.credential.type === "oauth") {
+                const cred = match.credential;
+                if (
+                  typeof cred.access === "string" &&
+                  cred.access &&
+                  typeof cred.expires === "number" &&
+                  Date.now() + 60_000 < cred.expires
+                ) {
+                  accessToken = cred.access;
+                  if (cred.projectId) projectId = cred.projectId;
                 }
-              } catch {
-                // best-effort snapshot inspection
               }
+            } catch {
+              // best-effort snapshot inspection
             }
-
-            if (!accessToken) {
-              const access = await authStorage.getOAuthAccessAt(PROVIDER_ID, acc.position);
-              if (access?.ok && access.accessToken) {
-                accessToken = access.accessToken;
-                if (access.projectId) projectId = access.projectId;
-              } else {
-                const err = access && !access.ok ? access.error : "offline";
-                return `${header}\n${projectLine}\n      Quota: unable to resolve access token (${err})`;
-              }
-            }
-
-            const usage = await fetchAccountUsage(
-              JSON.stringify({
-                token: accessToken,
-                projectId: projectId || "",
-              }),
-            );
-            const quotaLines = formatAccountQuotaSummary(usage)
-              .split("\n")
-              .map((line) => `      ${line}`)
-              .join("\n");
-            return `${header}\n${projectLine}\n${quotaLines}`;
-          } catch (error) {
-            return `${header}\n${projectLine}\n      Quota unavailable: ${safeError(error).slice(0, 100)}`;
           }
-        }),
-      );
+
+          if (!accessToken) {
+            const access = await authStorage.getOAuthAccessAt(PROVIDER_ID, acc.position);
+            if (access?.ok && access.accessToken) {
+              accessToken = access.accessToken;
+              if (access.projectId) projectId = access.projectId;
+            } else {
+              const err = access && !access.ok ? access.error : "offline";
+              return `${header}\n${projectLine}\n      Quota: unable to resolve access token (${err})`;
+            }
+          }
+
+          const usage = await fetchAccountUsage(
+            JSON.stringify({
+              token: accessToken,
+              projectId: projectId || "",
+              email: acc.email,
+            }),
+            { signal: inspectionDeadline.signal },
+          );
+          const quotaLines = formatAccountQuotaSummary(usage)
+            .split("\n")
+            .map((line) => `      ${line}`)
+            .join("\n");
+          return `${header}\n${projectLine}\n${quotaLines}`;
+        } catch (error) {
+          return `${header}\n${projectLine}\n      Quota unavailable: ${safeError(error).slice(0, 100)}`;
+        }
+      };
+      const inspectionDeadline = new AbortController();
+      const inspectionTimeout = setTimeout(() => inspectionDeadline.abort(), 20_000);
+      const accountRows = new Array<string>(accounts.length);
+      let nextAccount = 0;
+      const inspectWorker = async (): Promise<void> => {
+        while (true) {
+          const index = nextAccount++;
+          if (index >= accounts.length) return;
+          const account = accounts[index];
+          const { header, projectLine } = accountIdentity(account);
+          const timeoutResult = `${header}\n${projectLine}\n      Quota unavailable: account inspection deadline exceeded`;
+          if (inspectionDeadline.signal.aborted) {
+            accountRows[index] = timeoutResult;
+            continue;
+          }
+          let onAbort: (() => void) | undefined;
+          const abortResult = new Promise<string>((resolve) => {
+            onAbort = () => resolve(timeoutResult);
+            inspectionDeadline.signal.addEventListener("abort", onAbort, { once: true });
+            if (inspectionDeadline.signal.aborted) onAbort();
+          });
+          try {
+            accountRows[index] = await Promise.race([inspectAccount(account), abortResult]);
+          } finally {
+            if (onAbort) inspectionDeadline.signal.removeEventListener("abort", onAbort);
+          }
+        }
+      };
+      try {
+        await Promise.all(
+          Array.from({ length: Math.min(3, accounts.length) }, () => inspectWorker()),
+        );
+      } finally {
+        clearTimeout(inspectionTimeout);
+      }
       lines.push("", accountRows.join("\n\n"), "");
       lines.push("Switch account:");
       lines.push("  /antigravity.accounts <number|email>");
@@ -352,12 +398,10 @@ export default function (pi: ExtensionAPI): void {
           // OMP public API: re-runs fetchDynamicModels for this provider online.
           await ctx.modelRegistry.refreshProvider(PROVIDER_ID, "online");
         } else {
-          const creds = parseApiKey(apiKey);
-          const projectId = creds.projectId || undefined;
           const discovered = await discoverAntigravityModels(apiKey);
-          const next = resolvedCatalog(discovered, getCurrentAntigravityCatalog());
-          if (discovered.models.length > 0) {
-            applyAntigravityCatalog(next, projectId);
+          if (discovered.catalog.models.length > 0) {
+            const next = resolvedCatalog(discovered.catalog, getCurrentAntigravityCatalog());
+            applyAntigravityCatalog(next, discovered.projectId);
           }
         }
         const catalog = getCurrentAntigravityCatalog();
@@ -382,15 +426,16 @@ export default function (pi: ExtensionAPI): void {
     description: "Show sanitized Antigravity provider diagnostics",
     handler: async (_args, ctx) => {
       const apiKey = await resolveApiKeyFromContext(ctx);
-      let projectId: string | undefined;
+      let diagnosticsScope: string | undefined;
       if (apiKey) {
         try {
-          projectId = parseApiKey(apiKey).projectId || undefined;
+          const parsed = parseApiKey(apiKey);
+          diagnosticsScope = parsed.email || parsed.projectId || undefined;
         } catch {
           // bare token
         }
       }
-      const d = getLastDiagnostics(projectId);
+      const d = getLastDiagnostics(diagnosticsScope);
       const lines = [
         `provider=${PROVIDER_ID}`,
         `host=omp`,

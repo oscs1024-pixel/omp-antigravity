@@ -23,6 +23,19 @@ export function antigravityFetch(input: string | URL, init: RequestInit = {}): P
 }
 
 /**
+ * Combine a caller's cancellation signal with an HTTP deadline.
+ *
+ * Every request path in this plugin is bounded. The streaming path has its own
+ * header/stall watchdog; the remaining calls (OAuth token exchange, image
+ * generation) use this so a stalled endpoint surfaces as an error instead of an
+ * indefinite hang with no diagnostic.
+ */
+export function withDeadline(timeoutMs: number, signal?: AbortSignal): AbortSignal {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  return signal ? AbortSignal.any([signal, timeout]) : timeout;
+}
+
+/**
  * Open the connection when the extension loads so the first message of a session does
  * not pay the DNS + TCP + TLS setup. Best-effort: failures are ignored.
  */

@@ -303,24 +303,6 @@ export function convertMessages(
     }
   }
 
-  // Google Antigravity requires a natural-language user part in the request,
-  // including tool-only continuation turns. Keep injected Skills in the system
-  // instruction, then add this protocol bridge only when existing context gives
-  // the model something concrete to act on.
-  const hasUserText = contents.some(
-    (turn) =>
-      turn.role === GeminiRole.User &&
-      turn.parts.some((part) => "text" in part && Boolean(part.text.trim())),
-  );
-  if (!hasUserText && contents.length > 0) {
-    const bridge = {
-      text: CONTINUATION_TEXT,
-    };
-    const userTurn = contents.find((turn) => turn.role === GeminiRole.User);
-    if (userTurn) userTurn.parts.push(bridge);
-    else contents.unshift({ role: GeminiRole.User, parts: [bridge] });
-  }
-
   const lastTurn = contents.at(-1);
   if (lastTurn?.role === GeminiRole.Model) {
     if (lastTurn.parts.some((part) => "functionCall" in part)) {
@@ -329,6 +311,22 @@ export function convertMessages(
       );
     }
     appendTurn(contents, GeminiRole.User, [{ text: CONTINUATION_TEXT }]);
+  }
+
+  // Google Antigravity requires a natural-language user part in every request,
+  // including empty and tool-only continuation contexts.
+  const hasUserText = contents.some(
+    (turn) =>
+      turn.role === GeminiRole.User &&
+      turn.parts.some((part) => "text" in part && Boolean(part.text.trim())),
+  );
+  if (!hasUserText) {
+    const bridge = {
+      text: contents.length === 0 ? "Apply the active system instructions." : CONTINUATION_TEXT,
+    };
+    const userTurn = contents.find((turn) => turn.role === GeminiRole.User);
+    if (userTurn) userTurn.parts.push(bridge);
+    else contents.unshift({ role: GeminiRole.User, parts: [bridge] });
   }
 
   return contents;

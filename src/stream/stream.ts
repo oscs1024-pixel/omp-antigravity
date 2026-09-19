@@ -15,10 +15,11 @@ import {
   loadCodeAssist,
   parseApiKey,
   resolveProjectId,
+  recordSuccessfulEndpoint,
 } from "../client/client.js";
 import {
-  getCurrentEndpoint,
   runWithDiagnostics,
+  setLastAccountId,
   setLastEndpoint,
   setLastError,
   setLastLatencyMs,
@@ -26,12 +27,8 @@ import {
   setLastResolvedRuntimeModel,
   setLastStatus,
 } from "../diagnostics/diagnostics.js";
-import {
-  getCurrentAntigravityRouting,
-  getFallbackRuntimeModel,
-  PROVIDER_ID,
-} from "../models/models.js";
-import { safeError } from "../utils/security.js";
+import { getFallbackRuntimeModel, hasAntigravityRouting, PROVIDER_ID } from "../models/models.js";
+import { safeError, writePrivateFileNoFollow } from "../utils/security.js";
 import type { AntigravityStreamOptions } from "../types/types.js";
 import { antigravityEnv, recordSessionExecutionId } from "../utils/util.js";
 import { friendlyAntigravityError } from "./errors.js";
@@ -73,10 +70,10 @@ export function streamAntigravity(
         );
       }
       const creds = parseApiKey(apiKeyRaw);
+      setLastAccountId(creds.email);
       // Skip loadCodeAssist roundtrip when credentials already carry a projectId.
       const warmedProject = creds.projectId ? null : await loadCodeAssist(creds.token);
       const projectId = resolveProjectId({
-        token: creds.token,
         warmedProject,
         credentialProjectId: creds.projectId,
       });
@@ -85,7 +82,10 @@ export function streamAntigravity(
       // Single source of truth for the requested effort: `disableReasoning`
       // overrides `reasoning`, exactly as `buildRequest` applies it below.
       const effort = resolveRequestedEffort(opts);
-      const isKnownModel = model.id in getCurrentAntigravityRouting();
+      // Same account-scoped routing lookup `resolveInitialRuntimeModel` uses, so
+      // the "known model" shortcut can never disagree with the routing decision
+      // made on the very next line.
+      const isKnownModel = hasAntigravityRouting(model.id, projectId);
       const baseRuntimeModel = resolveInitialRuntimeModel(model.id, opts, projectId);
 
       let initialRuntimeModel = baseRuntimeModel;
@@ -105,8 +105,10 @@ export function streamAntigravity(
       }
 
       const requestHeaders = antigravityHeaders(creds.token);
+      const endpoints = endpointCandidates();
 
       let response: Response | undefined;
+      let responseEndpoint: string | undefined;
       let lastText = "";
       let received = false;
       let rawStopReason: string | undefined;
@@ -123,22 +125,36 @@ export function streamAntigravity(
           runtimeModel = runtimeCandidates[candIdx]!;
           setLastResolvedRuntimeModel(runtimeModel);
           const body = JSON.stringify(buildRequest(model, context, projectId, opts, runtimeModel));
+          response = undefined;
+          responseEndpoint = undefined;
+          lastText = "";
 
-          for (const endpoint of endpointCandidates()) {
+          for (let endpointOffset = 0; endpointOffset < endpoints.length; endpointOffset++) {
+            const endpoint = endpoints[(endpointOffset + emptyAttempt) % endpoints.length];
             setLastEndpoint(endpoint);
-            response = await fetchWithHeaderDeadline(
-              `${endpoint}/v1internal:streamGenerateContent?alt=sse`,
-              {
-                method: "POST",
-                headers: requestHeaders,
-                body,
-              },
-              opts.signal,
-              streamHeaderTimeoutMs(),
-              streamStallTimeoutMs(),
-            );
+            try {
+              response = await fetchWithHeaderDeadline(
+                `${endpoint}/v1internal:streamGenerateContent?alt=sse`,
+                {
+                  method: "POST",
+                  headers: requestHeaders,
+                  body,
+                },
+                opts.signal,
+                streamHeaderTimeoutMs(),
+                streamStallTimeoutMs(),
+              );
+            } catch (error) {
+              if (opts.signal?.aborted) throw error;
+              lastText = safeError(error);
+              setLastError(lastText);
+              continue;
+            }
             setLastStatus(response.status);
-            if (response.ok) break;
+            if (response.ok) {
+              responseEndpoint = endpoint;
+              break;
+            }
             lastText = await response.text();
             if (response.status === 401 || response.status === 403) {
               break;
@@ -193,13 +209,8 @@ export function streamAntigravity(
               } catch {
                 parsedBody = body;
               }
-              const fsp = await import("node:fs/promises");
-              const dumpPath = "/tmp/antigravity-last-request.json";
-              // mode applies only on creation — chmod covers a pre-existing dump
-              // written with wider permissions. The body contains full
-              // conversation text, so it must not be world-readable.
-              await fsp.writeFile(
-                dumpPath,
+              await writePrivateFileNoFollow(
+                "/tmp/antigravity-last-request.json",
                 JSON.stringify(
                   {
                     status: response?.status,
@@ -210,9 +221,7 @@ export function streamAntigravity(
                   null,
                   2,
                 ),
-                { mode: 0o600 },
               );
-              await fsp.chmod(dumpPath, 0o600);
             } catch {
               // ignore dump failures
             }
@@ -246,6 +255,8 @@ export function streamAntigravity(
         }
         if (received) {
           rawStopReason = streamed.rawStopReason;
+          if (responseEndpoint) recordSuccessfulEndpoint(responseEndpoint);
+          setLastError(undefined);
           break;
         }
       }
@@ -272,10 +283,6 @@ export function streamAntigravity(
       output.stopReason = opts.signal?.aborted ? "aborted" : "error";
       output.errorMessage = safeError(error);
       setLastError(output.errorMessage);
-      // Ensure endpoint is recorded even if failure happened before setLastEndpoint.
-      if (!getCurrentEndpoint() && endpointCandidates()[0]) {
-        setLastEndpoint(endpointCandidates()[0]);
-      }
       stream.push({ type: "error", reason: output.stopReason, error: output });
       stream.end();
     }

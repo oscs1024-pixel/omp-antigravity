@@ -1,4 +1,24 @@
+import { constants as fsConstants } from "node:fs";
+import { open } from "node:fs/promises";
 import { antigravityEnv } from "./util.js";
+
+/** Write private data without following a symlink at the final path. */
+export async function writePrivateFileNoFollow(
+  path: string,
+  data: string | Uint8Array,
+): Promise<void> {
+  const handle = await open(
+    path,
+    fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | fsConstants.O_NOFOLLOW,
+    0o600,
+  );
+  try {
+    await handle.chmod(0o600);
+    await handle.writeFile(data);
+  } finally {
+    await handle.close();
+  }
+}
 
 // `::1` is intentionally excluded: the registered redirect URI is
 // `http://localhost:51121`, which browsers almost always resolve to 127.0.0.1 —

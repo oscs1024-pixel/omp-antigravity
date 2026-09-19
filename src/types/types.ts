@@ -23,11 +23,11 @@ export type AntigravityOAuthCredentials = OAuthCredentials & {
 export type AntigravityApiKey = {
   token: string;
   projectId: string;
+  email?: string;
 };
 
 export type DynamicModelInfo = {
   id: string;
-  experiments?: string[];
   apiProvider?: string;
   modelProvider?: string;
   model?: string;
@@ -47,7 +47,10 @@ export type AntigravityRouting = {
 };
 
 // Stream & API Types
-export const ANTIGRAVITY_API = "antigravity-api" as const;
+// The provider's `api` id lives in src/stream/constants.ts (ANTIGRAVITY_API).
+// It is deliberately not re-declared here: a second copy once existed with a
+// different value ("antigravity-api"), which silently disagreed with the id
+// registerProvider hands OMP.
 
 /**
  * OMP hands providers `SimpleStreamOptions` verbatim, so this is a plain alias
@@ -277,6 +280,11 @@ export type ModelInfoRaw = {
   supportsThinking?: unknown;
   supportsImages?: unknown;
   recommended?: unknown;
+  /** Backend context-window limit (despite the ambiguous field name). */
+  maxTokens?: unknown;
+  maxOutputTokens?: unknown;
+  thinkingBudget?: unknown;
+  minThinkingBudget?: unknown;
   quotaInfo?: {
     remainingFraction?: unknown;
     resetTime?: unknown;

@@ -33,9 +33,11 @@
     "lint": "eslint src",
     "lint:fix": "eslint src --fix",
     "test": "bun test",
+    "security-check": "bun scripts/security-check.ts",
+    "check:scripts": "bun scripts/security-check.ts && bun scripts/test-http-fetch.ts && bun scripts/test-image-gen.ts && bun scripts/test-model-discovery.ts && bun scripts/test-model-routing.ts && bun scripts/test-stream-header-deadline.ts && bun scripts/test-stream-sse.ts && bun scripts/test-usage-formatter.ts",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "check": "bun run typecheck && bun run lint && bun test && bun run format:check"
+    "check": "bun run typecheck && bun run lint && bun test && bun run check:scripts && bun run format:check"
   },
   "peerDependencies": {
     "@oh-my-pi/pi-ai": ">=18.0.0",

@@ -40,10 +40,10 @@
 
 - **直连原生端点**：直接调用 Google Cloud Code Assist 内部 gRPC-Web / HTTP SSE API，支持连接预热与零外部 CLI 开销。
 - **独立安全认证**：实现符合 RFC 7636 的 OAuth 2.0 PKCE 授权码流程，支持本地独立回调服务与远程无头环境（Headless）终端粘贴回退。自动检测免费层账号并触发 `/v1internal:onboardUser` 开通。
-- **完备流式与断流防御**：严格校验 `finishReason`，自动拒绝仅含思考（Thought-only）或异常截断的流式帧并触发优雅重试；接入 OMP 标准 `ProviderHttpError` / `ProviderResponseError`。
+- **完备流式与断流防御**：严格校验 `finishReason`，对不含任何文本与工具调用的空响应帧自动退避重试；接入 OMP 标准 `ProviderHttpError` / `ProviderResponseError`。
 - **多模型动态发现与智能折叠**：运行时自动拉取账号可用的 Gemini、Claude 与 GPT-OSS 矩阵，将底层分散的 runtime-model（如 `-low`/`-medium`/`-high`）折叠为符合 OMP 交互规范的标准模型 ID。
 - **全方位用量与额度报告**：集成 OMP 原生 `UsageProvider`，聚合 `/v1internal:retrieveUserQuotaSummary` 共享配额池；在免费层或接口受限时自动回退为模型级额度，区分 Google / Anthropic / OpenAI 计数器。
-- **防御型生图工具**：注册具备 `approval: "write"` 权限级别的 `generate_antigravity_image`，动态发现账号广告图片模型，并在文件落盘前后执行严格的符号链接（Symlink）逃逸与覆写检查。
+- **防御型生图工具**：注册具备 `approval: "write"` 权限级别的 `generate_antigravity_image`，按内置生图模型候选清单（`gemini-3-pro-image` 起）依次尝试，并在文件落盘前后执行严格的符号链接（Symlink）逃逸与覆写检查。
 
 ---
 
@@ -141,7 +141,7 @@ flowchart TD
 - **本地双轨回调与无头终端回退**：
   - **本地模式**：在 `127.0.0.1:51121/oauth-callback` 启动单次 HTTP 监听器，接收浏览器重定向；设置严格的 CSP、`no-store` 和 `Referrer-Policy` 响应头，完成后立即释放端口。
   - **无头/远程模式**：在远程服务器或 SSH 场景下，浏览器无法直连 localhost。用户复制重定向后浏览器地址栏的完整 URL（包含 `code` 与 `state`），直接粘贴到 OMP 终端的提示符，插件内置安全提取与校验解析器。
-- **自动开通 (Onboarding)**：换取 Token 后调用 `loadCodeAssist` 检查账号层级；若账号为新开通未分配项目状态，自动调用 `/v1internal:onboardUser` 申请免费层分配并以指数退避轮询等待就绪，真实绑定 Google 分配的 `cloudaicompanionProject`。
+- **自动开通 (Onboarding)**：换取 Token 后调用 `loadCodeAssist` 检查账号层级；若账号尚未开通（响应中缺少 `currentTier`），自动调用 `/v1internal:onboardUser` 申请免费层分配，并以 1s 间隔轮询长时操作（整体 30s 预算）等待就绪，真实绑定 Google 分配的 `cloudaicompanionProject`。开通失败不会阻塞登录，失败原因记入 `/antigravity.doctor` 诊断。
 - **Token 刷新与防抖**：OMP `AuthStorage` 托管 Token 过期检测，在失效前透明调用 `refreshAntigravityToken`。
 - **原生多账号池与会话锁定**：支持多次运行 `/login antigravity` 登录多个不同 Google 账号，OMP 宿主 `AuthStorage` 依据独立邮箱去重并隔离存储/刷新。支持使用 `/antigravity.accounts` 或 `/session pin` 查看各账号配额并锁定会话；当遇 429 配额耗尽时 OMP 自动冷却并轮转至额度充足的兄弟账号。
 
@@ -197,9 +197,9 @@ sequenceDiagram
 位于 `src/stream/`，承载 OMP 与 Cloud Code Assist 间的双向请求与响应转换。经过模块化重构拆分为 8 个核心子模块：
 
 1. **`request.ts` (请求组装与信封)**：
-   - 使用 `deriveSignedDecimalFromHash` 派生跨请求一致且稳定的 63 位有符号十进制 `sessionId`。
+   - 优先使用 OMP 传入的会话 `sessionId`；仅在脱离 OMP 直接调用时生成 UUID 作为后备。
    - 从会话上下文提取上一轮助手的 `last_execution_id` 并串联入信封，组装标准 `requestId` (`<trajectoryId>-<reqIndex>`)。支持逃生开关 `ANTIGRAVITY_DISABLE_LAST_EXECUTION_ID=1` 紧急旁路。
-   - 强制为所有工具调用及 Claude 模型注入 `GeminiToolCallingMode.Validated` 模式，并自动附带 `FORCED_TOOL_DIRECTIVE`。
+   - 有工具且未显式指定模式时使用 `GeminiToolCallingMode.Validated`；非 Claude 模型仅在显式强制工具调用（`Any`）时附加 `FORCED_TOOL_DIRECTIVE`，Claude 请求始终使用 `Validated`。
 2. **`messages.ts` (消息转换)**：将 OMP 多轮消息转为 Gemini Wire 格式，支持多模态图像分块；自动维护 `thoughtSignature` 的连续性与前置用户指令桥接。
 3. **`schema.ts` (Schema 规范转换)**：深度遍历反引用本地与外部 JSON Schema，自动剥离 `$schema`，安全展开为合法的 `GeminiFunctionDeclaration`。
 4. **`fetch.ts` (双看门狗网络请求)**：支持首包响应头超时看门狗（`streamHeaderTimeoutMs`，默认 180s）与中途卡顿无数据看门狗（`streamStallTimeoutMs`，默认 120s）。
@@ -222,7 +222,7 @@ sequenceDiagram
 
     Agent->>Stream: streamAntigravity(model, context, options)
     Stream->>Req: buildRequest() 组装信封
-    Note over Req: 1. deriveSignedDecimalFromHash 派生稳定 63位十进制 sessionId<br/>2. 上下文获取 last_execution_id 串联 trajectory<br/>3. 强制注入 GeminiToolCallingMode.Validated<br/>4. 将 ToolChoice 转换为 functionCallingConfig
+    Note over Req: 1. 优先沿用 OMP 会话 sessionId，独立调用时回退 UUID<br/>2. 上下文获取 last_execution_id 串联 trajectory<br/>3. 按模型与 ToolChoice 选择 functionCallingConfig<br/>4. 非 Claude 的强制工具调用附加 FORCED_TOOL_DIRECTIVE
     Req-->>Stream: 返回 AntigravityGenerateRequest JSON
 
     Stream->>Fetch: fetchWithHeaderDeadline(url, body, signal)
@@ -291,7 +291,7 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    Trigger["OMP 启动或执行 /antigravity.refresh"] --> FetchAPI["GET /v1internal:fetchAvailableModels"]
+    Trigger["OMP 启动或执行 /antigravity.refresh"] --> FetchAPI["POST /v1internal:fetchAvailableModels"]
     FetchAPI --> RawList["获取上游返回的原始模型列表"]
 
     RawList --> DenylistFilter{"过滤 ANTIGRAVITY_DISCOVERY_DENYLIST<br/>(chat_20706, chat_23310, gemini-2.5-pro 等废弃模型)"}
@@ -354,7 +354,7 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    ToolCall["Agent 触发 generate_antigravity_image 工具调用"] --> ModelDetect["优先从动态目录中匹配已授权生图模型<br/>(如: gemini-3-pro-image)"]
+    ToolCall["Agent 触发 generate_antigravity_image 工具调用"] --> ModelDetect["按内置生图模型候选清单依次尝试<br/>(gemini-3-pro-image 起)"]
     ModelDetect --> GenSSE["POST /v1internal:streamGenerateContent (图片生成流)"]
     GenSSE --> ParseBytes["从 mimeType='image/png' 提取 Base64 图片数据"]
 
@@ -504,6 +504,7 @@ Antigravity 平台提供跨厂商的多模型支持。插件将各模型折叠�
 | `ANTIGRAVITY_PROJECT_ID`                | -             | 显式指定 Cloud Code Assist 项目 ID，跳过自动项目发现 round-trip。                                                       |
 | `ANTIGRAVITY_CALLBACK_HOST`             | `127.0.0.1`   | OAuth 本地监听绑定地址（仅限 `127.0.0.1` 或 `localhost`）。                                                             |
 | `ANTIGRAVITY_RUNTIME_MODEL`             | -             | 强制锁定所有请求至特定的底层 runtime model ID。                                                                         |
+| `ANTIGRAVITY_USER_AGENT`                | 内置 CLI 指纹 | 覆盖请求 User-Agent；默认值与 Antigravity CLI 保持一致。                                                                |
 | `ANTIGRAVITY_CLIENT_ID`                 | 官方默认值    | 自定义 Google OAuth 客户端 ID。                                                                                         |
 | `ANTIGRAVITY_CLIENT_SECRET`             | 官方默认值    | 自定义 Google OAuth 客户端密钥。                                                                                        |
 | `ANTIGRAVITY_STREAM_HEADER_TIMEOUT_MS`  | `180000` (3m) | 响应首包响应头超时阈值（毫秒）；设为 `0` 禁用。                                                                         |
@@ -511,6 +512,8 @@ Antigravity 平台提供跨厂商的多模型支持。插件将各模型折叠�
 | `ANTIGRAVITY_NO_PREWARM`                | `0`           | 设为 `1` 可跳过插件加载时针对主端点的 TLS 提前连接预热。                                                                |
 | `ANTIGRAVITY_DEBUG_DUMP`                | `0`           | 设为 `1` 时，请求失败将完整 JSON 请求体写入 `/tmp/antigravity-last-request.json`。                                      |
 | `ANTIGRAVITY_DISABLE_LAST_EXECUTION_ID` | `0`           | 逃生开关：设为 `1` 时禁用向请求 labels 中注入 `last_execution_id`，用于在 Google 服务端多轮轨迹会话出现异常时紧急绕过。 |
+
+> OMP 的 `providers.antigravityEndpoint` 配置不会传递给本插件；如需覆盖服务端点，请使用 `ANTIGRAVITY_BASE_URL`。该值仅接受受信任的 Google HTTPS 域名。
 
 ---
 
@@ -568,6 +571,10 @@ npm run security-check
 # 6. 一键全项检查
 npm run check
 ```
+
+`npm run check` 覆盖类型检查、Lint、单元测试（`test/`）与确定性脚本断言（`scripts/` 下 8 个离线脚本，含 SSE 解析、流看门狗、用量格式化、模型折叠、安全断言）。
+
+需要真实凭据或联网的实时烟测脚本不在门禁内，需手动执行：`scripts/smoke-tool-schema.ts`、`scripts/smoke-all-models.mjs`、`scripts/omp-credentials.mjs`、`scripts/load-check.mjs`。
 
 ---
 

@@ -12,7 +12,7 @@ import { assertSafeApiBaseUrl, safeError } from "../utils/security.js";
 import type { AntigravityApiKey, AvailableModelsRaw, DynamicModelInfo } from "../types/types.js";
 import { antigravityEnv, asString, escapeRegExp, isRecord, stableUuid } from "../utils/util.js";
 import { antigravityFetch } from "../utils/http.js";
-import { registerDiscoveredModelEnums, registerModelEnum } from "../models/models.js";
+import { registerDiscoveredModelEnums } from "../models/models.js";
 
 export const DEFAULT_ENDPOINT = "https://daily-cloudcode-pa.googleapis.com";
 /** Ordered endpoint candidates; module-private since `endpointCandidates` is the accessor. */
@@ -21,6 +21,7 @@ const ENDPOINT_FALLBACKS = [
   "https://daily-cloudcode-pa.sandbox.googleapis.com",
   "https://cloudcode-pa.googleapis.com",
 ];
+let lastGoodEndpoint: string | undefined;
 
 const PROJECT_CACHE_TTL_MS = 30 * 60 * 1000;
 /** Hard cap on cached (token) project id lookups; oldest entries are dropped first. */
@@ -32,32 +33,61 @@ const MODEL_CACHE_TTL_MS = 30 * 60 * 1000;
 const MODEL_CACHE_MAX_ENTRIES = 64;
 const modelCache = new Map<string, { result: DynamicModelInfo | undefined; expiresAt: number }>();
 
-/** Metadata lookups (project/model discovery) must be fast; a stalled endpoint should
- * fall through to the next candidate instead of hanging the whole request. */
-const DISCOVERY_TIMEOUT_MS = 8000;
+/** Metadata lookups (project/model discovery, onboarding) must be fast; a stalled
+ * endpoint should fall through to the next candidate instead of hanging the whole
+ * request. Exported so every metadata call site shares one deadline. */
+export const DISCOVERY_TIMEOUT_MS = 8000;
 
 /** In-flight de-dupe: concurrent requests for the same (token, project, model) share one probe. */
 const inFlightModelLookups = new Map<string, Promise<DynamicModelInfo | undefined>>();
 
-/** UUID-shaped stable id from a seed (account email preferred over cwd). */
+/** UUID-shaped stable id from a seed. Never seeded from process.cwd(). */
 export function stableProjectId(seed: string): string {
   return stableUuid(`antigravity:${seed}`);
 }
 
 /**
- * Fallback project id when discovery fails.
- * Prefer ANTIGRAVITY_PROJECT_ID, then a stable seed (email), never process.cwd().
+ * Seed for the synthetic placeholder project id.
+ *
+ * Deliberately a single constant rather than something account-derived: the
+ * placeholder is computed independently on the discovery path (which only ever
+ * sees a bare access token) and on the request path (which reads the stored
+ * credential), so any account-specific seed would make those two disagree and
+ * split one account across two per-project routing buckets.
  */
-export function defaultProjectId(seed = "antigravity-default"): string {
-  return antigravityEnv("PROJECT_ID")?.trim() || stableProjectId(seed);
+const FALLBACK_PROJECT_SEED = "antigravity-default";
+
+/**
+ * Fallback project id when discovery fails.
+ * Prefer ANTIGRAVITY_PROJECT_ID, then the shared stable placeholder.
+ */
+export function defaultProjectId(): string {
+  return antigravityEnv("PROJECT_ID")?.trim() || stableProjectId(FALLBACK_PROJECT_SEED);
 }
 
-/** @deprecated Use defaultProjectId(seed); kept for scripts that imported the old constant. */
+/** @deprecated Use defaultProjectId(); kept for scripts that imported the old constant. */
 export const DEFAULT_PROJECT_ID = defaultProjectId();
 
 export function endpointCandidates(): string[] {
   const explicit = antigravityEnv("BASE_URL")?.trim();
-  return explicit ? [assertSafeApiBaseUrl(explicit)] : ENDPOINT_FALLBACKS;
+  if (explicit) return [assertSafeApiBaseUrl(explicit)];
+  if (!lastGoodEndpoint || !ENDPOINT_FALLBACKS.includes(lastGoodEndpoint)) {
+    return [...ENDPOINT_FALLBACKS];
+  }
+  return [
+    lastGoodEndpoint,
+    ...ENDPOINT_FALLBACKS.filter((endpoint) => endpoint !== lastGoodEndpoint),
+  ];
+}
+
+export function recordSuccessfulEndpoint(endpoint: string): void {
+  if (ENDPOINT_FALLBACKS.includes(endpoint)) {
+    lastGoodEndpoint = endpoint;
+  }
+}
+
+export function resetEndpointPreferenceForTests(): void {
+  lastGoodEndpoint = undefined;
 }
 
 const DEFAULT_USER_AGENT =
@@ -81,6 +111,8 @@ export interface PostJsonOptions {
   signal?: AbortSignal;
   timeoutMs?: number;
   headers?: Record<string, string>;
+  /** Internal: callers aggregating parallel endpoints select the winner explicitly. */
+  recordSuccess?: boolean;
 }
 
 export interface PostJsonResponse<T = unknown> {
@@ -103,6 +135,13 @@ export class AntigravityHttpError extends Error {
   }
 }
 
+export class AntigravityAccountIneligibleError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AntigravityAccountIneligibleError";
+  }
+}
+
 /**
  * Returns true only for HTTP status codes that indicate endpoint-specific
  * transient errors (404 Not Found, 500 Internal, 502 Bad Gateway, 503 Service
@@ -116,12 +155,16 @@ export function isRetryableEndpointStatus(status: number): boolean {
 }
 
 /**
- * Send a single POST JSON request to a specific Antigravity endpoint.
+ * Send one JSON request to a specific Antigravity endpoint.
+ *
+ * Shared core for the two verbs this provider speaks: the metadata/turn RPCs are
+ * POSTs, while long-running-operation polling after `onboardUser` is a GET.
  */
-export async function postEndpointJson<T = unknown>(
+async function requestEndpointJson<T = unknown>(
   endpoint: string,
   path: string,
   token: string,
+  method: "GET" | "POST",
   body: unknown,
   options: PostJsonOptions = {},
 ): Promise<PostJsonResponse<T>> {
@@ -132,13 +175,13 @@ export async function postEndpointJson<T = unknown>(
       : (options.signal ?? timeout);
 
   const res = await antigravityFetch(`${endpoint}${path}`, {
-    method: "POST",
+    method,
     headers: {
       ...antigravityHeaders(token),
       Accept: "application/json",
       ...options.headers,
     },
-    body: JSON.stringify(body),
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     signal,
   });
   setLastEndpoint(endpoint);
@@ -163,26 +206,40 @@ export async function postEndpointJson<T = unknown>(
       data,
     );
   }
+  if (options.recordSuccess !== false) recordSuccessfulEndpoint(endpoint);
 
   return { endpoint, status: res.status, data: data as T };
 }
 
-/**
- * Send a POST JSON request iterating through endpointCandidates() in priority order.
- * - 2xx: returns immediately.
- * - 401, 403, 429, or client 4xx: throws immediately (account/quota-level, non-retryable across endpoints).
- * - 404, 500-504, or network errors: retries on next candidate endpoint.
- */
-export async function postAntigravityJson<T = unknown>(
+/** Send a single POST JSON request to a specific Antigravity endpoint. */
+export async function postEndpointJson<T = unknown>(
+  endpoint: string,
   path: string,
   token: string,
   body: unknown,
   options: PostJsonOptions = {},
 ): Promise<PostJsonResponse<T>> {
+  return requestEndpointJson<T>(endpoint, path, token, "POST", body, options);
+}
+
+/**
+ * Iterate through endpointCandidates() in priority order.
+ * - 2xx: returns immediately.
+ * - 401, 403, 429, or client 4xx: throws immediately (account/quota-level, non-retryable across endpoints).
+ * - 404, 500-504, or network errors: retries on next candidate endpoint.
+ */
+async function requestAntigravityJson<T = unknown>(
+  path: string,
+  token: string,
+  method: "GET" | "POST",
+  body: unknown,
+  options: PostJsonOptions = {},
+): Promise<PostJsonResponse<T>> {
+  const endpoints = endpointCandidates();
   let lastErrorText = "";
-  for (const endpoint of endpointCandidates()) {
+  for (const endpoint of endpoints) {
     try {
-      return await postEndpointJson<T>(endpoint, path, token, body, options);
+      return await requestEndpointJson<T>(endpoint, path, token, method, body, options);
     } catch (error) {
       if (options.signal?.aborted) {
         throw error;
@@ -199,6 +256,25 @@ export async function postAntigravityJson<T = unknown>(
     }
   }
   throw new Error(`${path} failed: ${lastErrorText || "no endpoint available"}`);
+}
+
+/** POST JSON across endpoint candidates, per {@link requestAntigravityJson}. */
+export async function postAntigravityJson<T = unknown>(
+  path: string,
+  token: string,
+  body: unknown,
+  options: PostJsonOptions = {},
+): Promise<PostJsonResponse<T>> {
+  return requestAntigravityJson<T>(path, token, "POST", body, options);
+}
+
+/** GET JSON across endpoint candidates, per {@link requestAntigravityJson}. */
+export async function getAntigravityJson<T = unknown>(
+  path: string,
+  token: string,
+  options: PostJsonOptions = {},
+): Promise<PostJsonResponse<T>> {
+  return requestAntigravityJson<T>(path, token, "GET", undefined, options);
 }
 
 export function jsonOrTextError(text: string): string {
@@ -224,9 +300,13 @@ export function parseApiKey(apiKeyRaw: string | undefined): AntigravityApiKey {
     // Not JSON — fall through to the bare-token form below.
   }
   if (parsed?.token) {
-    // Structured form from getApiKey(): {token, projectId}. A missing projectId
-    // is not fatal — callers fall back to loadCodeAssist discovery.
-    return { token: parsed.token, projectId: parsed.projectId ?? "" };
+    // Structured form from getApiKey(): {token, projectId, email}. A missing
+    // projectId is not fatal — callers fall back to loadCodeAssist discovery.
+    return {
+      token: parsed.token,
+      projectId: parsed.projectId ?? "",
+      email: parsed.email,
+    };
   }
   // OMP's AuthStorage.peekApiKey hands OAuth access tokens to extension
   // fetchDynamicModels as a bare string (no JSON wrapper), so accept that form
@@ -263,13 +343,19 @@ export function extractProjectId(data: unknown): string | undefined {
   return undefined;
 }
 
-async function listCloudAICompanionProjects(token: string): Promise<string | undefined> {
+async function listCloudAICompanionProjects(
+  token: string,
+  signal?: AbortSignal,
+): Promise<string | undefined> {
   try {
-    const res = await postAntigravityJson(
+    const primaryEndpoint = endpointCandidates()[0];
+    if (!primaryEndpoint) return undefined;
+    const res = await postEndpointJson(
+      primaryEndpoint,
       "/v1internal:listCloudAICompanionProjects",
       token,
       {},
-      { timeoutMs: DISCOVERY_TIMEOUT_MS },
+      { signal, timeoutMs: DISCOVERY_TIMEOUT_MS },
     );
     return extractProjectId(res.data);
   } catch (error) {
@@ -357,16 +443,9 @@ export function buildModelMatchRegex(requestedId: string): RegExp {
 function dynamicModelFromInfo(modelId: string, info: unknown): DynamicModelInfo {
   if (!isRecord(info)) return { id: modelId };
   setLastMatchedModelDebug(summarizeModelCandidate({ modelId, ...info }));
-  const experiments = Array.isArray(info.modelExperiments)
-    ? info.modelExperiments.filter((item): item is string => typeof item === "string")
-    : undefined;
   const modelEnum = asString(info.model);
-  if (modelEnum) {
-    registerModelEnum(modelId, modelEnum);
-  }
   return {
     id: modelId,
-    experiments,
     apiProvider: asString(info.apiProvider),
     modelProvider: asString(info.modelProvider),
     model: modelEnum,
@@ -444,7 +523,7 @@ async function fetchAvailableRuntimeModelUncached(
         { timeoutMs: DISCOVERY_TIMEOUT_MS },
       );
       if (isRecord(data) && isRecord(data.models)) {
-        registerDiscoveredModelEnums(data.models as Record<string, { model?: unknown }>);
+        registerDiscoveredModelEnums(data.models as Record<string, { model?: unknown }>, projectId);
       }
       const labels = [...new Set(collectModelLabels(data))].slice(0, 16);
       if (labels.length) lastLabels = labels.join(",");
@@ -501,45 +580,53 @@ export async function fetchAvailableRuntimeModel(
   }
 }
 
+type AvailableModelsAttempt =
+  | { result: { endpoint: string; status: number; data: unknown }; error?: never }
+  | { result?: never; error: unknown };
+
 async function fetchAvailableModelsFromEndpoint(
   endpoint: string,
   token: string,
   projectId: string,
   signal?: AbortSignal,
-): Promise<{ endpoint: string; status: number; data: unknown } | undefined> {
+): Promise<AvailableModelsAttempt> {
   try {
-    return await postEndpointJson(
-      endpoint,
-      "/v1internal:fetchAvailableModels",
-      token,
-      { project: projectId },
-      { signal, timeoutMs: DISCOVERY_TIMEOUT_MS },
-    );
-  } catch {
-    return undefined;
+    return {
+      result: await postEndpointJson(
+        endpoint,
+        "/v1internal:fetchAvailableModels",
+        token,
+        { project: projectId },
+        { signal, timeoutMs: DISCOVERY_TIMEOUT_MS, recordSuccess: false },
+      ),
+    };
+  } catch (error) {
+    setLastError(safeError(error));
+    return { error };
   }
 }
 
 /** Merge catalog payloads from one or more fetchAvailableModels responses. */
 export function mergeAvailableModelsResults(
   results: Array<{ endpoint: string; status: number; data: unknown } | undefined>,
+  projectId?: string,
 ): { endpoint: string; status: number; data: AvailableModelsRaw } {
   const mergedModels: Record<string, unknown> = {};
   let defaultAgentModelId: string | undefined;
   let defaultAgentModel: string | undefined;
-  let lastEndpoint = "";
-  let lastStatus = 0;
+  let selectedEndpoint = "";
+  let selectedStatus = 0;
 
   for (const result of results) {
     if (!result) continue;
-    setLastEndpoint(result.endpoint);
-    setLastStatus(result.status);
-    lastEndpoint = result.endpoint;
-    lastStatus = result.status;
+    if (!selectedEndpoint) {
+      selectedEndpoint = result.endpoint;
+      selectedStatus = result.status;
+    }
     const data = result.data;
     if (isRecord(data) && isRecord(data.models)) {
       Object.assign(mergedModels, data.models);
-      registerDiscoveredModelEnums(data.models as Record<string, { model?: unknown }>);
+      registerDiscoveredModelEnums(data.models as Record<string, { model?: unknown }>, projectId);
     }
     if (isRecord(data) && typeof data.defaultAgentModelId === "string") {
       defaultAgentModelId = data.defaultAgentModelId;
@@ -549,13 +636,14 @@ export function mergeAvailableModelsResults(
     }
   }
 
-  if (!lastEndpoint) {
+  if (!selectedEndpoint) {
     throw new Error(`/v1internal:fetchAvailableModels failed: no endpoint available`);
   }
-
+  setLastEndpoint(selectedEndpoint);
+  setLastStatus(selectedStatus);
   return {
-    endpoint: lastEndpoint,
-    status: lastStatus,
+    endpoint: selectedEndpoint,
+    status: selectedStatus,
     data: {
       models: mergedModels as AvailableModelsRaw["models"],
       defaultAgentModelId,
@@ -573,37 +661,161 @@ export async function fetchAvailableModelsCatalog(
   projectId: string,
   signal?: AbortSignal,
 ): Promise<{ endpoint: string; status: number; data: AvailableModelsRaw }> {
-  const results = await Promise.all(
-    endpointCandidates().map((endpoint) =>
+  const endpoints = endpointCandidates();
+  const attempts = await Promise.all(
+    endpoints.map((endpoint) =>
       fetchAvailableModelsFromEndpoint(endpoint, token, projectId, signal),
     ),
   );
-  return mergeAvailableModelsResults(results);
+  const results = attempts.flatMap((attempt) => (attempt.result ? [attempt.result] : []));
+  if (results.length === 0) {
+    for (let index = attempts.length - 1; index >= 0; index -= 1) {
+      const error = attempts[index]?.error;
+      if (error !== undefined) {
+        throw error instanceof Error ? error : new Error(safeError(error));
+      }
+    }
+  }
+  const preferred = results[0];
+  if (preferred) recordSuccessfulEndpoint(preferred.endpoint);
+  return mergeAvailableModelsResults(results, projectId);
 }
 
-async function loadCodeAssistUncached(token: string): Promise<string | undefined> {
-  try {
-    const res = await postAntigravityJson(
-      "/v1internal:loadCodeAssist",
-      token,
-      {
-        metadata: {
-          ideType: "ANTIGRAVITY",
-        },
-      },
-      { timeoutMs: DISCOVERY_TIMEOUT_MS },
+/** Tier id the Cloud Code Assist onboarding RPC provisions. */
+const FREE_TIER_ID = "free-tier";
+/** Budget for the whole onboardUser exchange, polling included. */
+const ONBOARD_TIMEOUT_MS = 30_000;
+const ONBOARD_POLL_INTERVAL_MS = 1_000;
+
+type OnboardOperation = {
+  name?: string;
+  done?: boolean;
+  error?: { code?: number; message?: string } | null;
+};
+
+/**
+ * `loadCodeAssist` reports `currentTier` only once the account has been provisioned
+ * for Cloud Code Assist. An account that has just authorised for the first time
+ * answers without it and needs `onboardUser` to bind a `cloudaicompanionProject`.
+ */
+export function hasProvisionedTier(data: unknown): boolean {
+  return isRecord(data) && data.currentTier !== undefined && data.currentTier !== null;
+}
+
+function freeTierIneligibility(data: unknown): string | undefined {
+  if (!isRecord(data)) return undefined;
+  const ineligibleTiers: unknown = data.ineligibleTiers;
+  if (!Array.isArray(ineligibleTiers)) return undefined;
+  const tier: unknown = ineligibleTiers.find(
+    (value) => isRecord(value) && asString(value.id) === FREE_TIER_ID,
+  );
+  if (!isRecord(tier)) return undefined;
+  const reason =
+    asString(tier.reasonMessage) ??
+    asString(tier.reason) ??
+    asString(tier.message) ??
+    "Free-tier onboarding is not available for this account.";
+  const validationUrl = asString(tier.validationUrl) ?? asString(tier.validation_url);
+  return validationUrl ? `${reason} Verify: ${validationUrl}` : reason;
+}
+
+/**
+ * Provision the free tier for a freshly authorised account.
+ *
+ * Speaks the same protocol as OMP's built-in `google-antigravity` provider:
+ * POST `onboardUser`, then poll the returned long-running operation until it
+ * reports `done`. Throws on failure so the caller can choose to degrade.
+ */
+export async function onboardUser(token: string, signal?: AbortSignal): Promise<void> {
+  const deadline = Date.now() + ONBOARD_TIMEOUT_MS;
+  const remaining = (): number => {
+    const left = deadline - Date.now();
+    if (left <= 0) throw new Error(`onboardUser timed out after ${ONBOARD_TIMEOUT_MS}ms`);
+    return left;
+  };
+  const onboardBody = { tierId: FREE_TIER_ID, metadata: { ideType: "ANTIGRAVITY" } };
+
+  let operation = (
+    await postAntigravityJson<OnboardOperation>("/v1internal:onboardUser", token, onboardBody, {
+      signal,
+      timeoutMs: remaining(),
+    })
+  ).data;
+
+  while (operation?.done !== true) {
+    const name = typeof operation?.name === "string" ? operation.name : "";
+    if (!name) throw new Error("onboardUser returned an operation without a name");
+    await new Promise((resolve) =>
+      setTimeout(resolve, Math.min(ONBOARD_POLL_INTERVAL_MS, remaining())),
     );
-    const project = extractProjectId(res.data);
+    if (signal?.aborted) throw new Error("onboardUser aborted");
+    operation = (
+      await getAntigravityJson<OnboardOperation>(`/v1internal/${name}`, token, {
+        signal,
+        timeoutMs: remaining(),
+      })
+    ).data;
+  }
+
+  if (operation.error) {
+    const code = typeof operation.error.code === "number" ? `${operation.error.code}: ` : "";
+    throw new Error(`onboardUser failed: ${code}${operation.error.message ?? "unknown error"}`);
+  }
+}
+
+/** Body of the account-tier probe. Shared by discovery and usage diagnostics. */
+const LOAD_CODE_ASSIST_BODY = { metadata: { ideType: "ANTIGRAVITY" } };
+
+export function fetchCodeAssistMetadata(
+  token: string,
+  signal?: AbortSignal,
+): Promise<PostJsonResponse<unknown>> {
+  return postAntigravityJson("/v1internal:loadCodeAssist", token, LOAD_CODE_ASSIST_BODY, {
+    signal,
+    timeoutMs: DISCOVERY_TIMEOUT_MS,
+  });
+}
+
+async function loadCodeAssistUncached(
+  token: string,
+  signal?: AbortSignal,
+): Promise<string | undefined> {
+  try {
+    const read = (): Promise<PostJsonResponse<unknown>> => fetchCodeAssistMetadata(token, signal);
+
+    let data = (await read()).data;
+    if (!hasProvisionedTier(data)) {
+      const ineligible = freeTierIneligibility(data);
+      if (ineligible) {
+        setLastError(ineligible);
+        throw new AntigravityAccountIneligibleError(ineligible);
+      }
+      // Never provisioned: without onboarding this account can never resolve a
+      // project, so the fallback placeholder would stick forever. Failures keep
+      // the login usable — they are recorded for /antigravity.doctor instead.
+      try {
+        await onboardUser(token, signal);
+        data = (await read()).data;
+      } catch (error) {
+        setLastError(`onboardUser: ${safeError(error)}`);
+      }
+    }
+
+    const project = extractProjectId(data);
     if (project) return project;
-    return await listCloudAICompanionProjects(token);
+    return await listCloudAICompanionProjects(token, signal);
   } catch (error) {
     setLastError(safeError(error));
+    if (error instanceof AntigravityAccountIneligibleError) throw error;
     return undefined;
   }
 }
 
 /** Discover project id with a short in-memory LRU cache keyed by access token. */
-export async function loadCodeAssist(token: string): Promise<string | undefined> {
+export async function loadCodeAssist(
+  token: string,
+  signal?: AbortSignal,
+): Promise<string | undefined> {
   const cached = projectCache.get(token);
   if (cached) {
     if (cached.expiresAt > Date.now()) {
@@ -616,7 +828,7 @@ export async function loadCodeAssist(token: string): Promise<string | undefined>
     projectCache.delete(token);
   }
 
-  const projectId = await loadCodeAssistUncached(token);
+  const projectId = await loadCodeAssistUncached(token, signal);
   if (projectId) {
     projectCache.set(token, { projectId, expiresAt: Date.now() + PROJECT_CACHE_TTL_MS });
 
@@ -630,16 +842,14 @@ export async function loadCodeAssist(token: string): Promise<string | undefined>
 }
 
 export function resolveProjectId(opts: {
-  token: string;
   credentialProjectId?: string;
-  email?: string;
   warmedProject?: string | null;
 }): string {
   return (
     antigravityEnv("PROJECT_ID")?.trim() ||
     opts.warmedProject ||
     opts.credentialProjectId ||
-    defaultProjectId(opts.email || "antigravity-default")
+    defaultProjectId()
   );
 }
 
