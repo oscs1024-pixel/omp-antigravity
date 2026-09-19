@@ -1,6 +1,6 @@
 {
   "name": "omp-antigravity",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "Google Antigravity (Cloud Code Assist) provider and image generation for Oh My Pi (OMP).",
   "author": "Rahul Arya",
   "license": "MIT",

@@ -8,6 +8,29 @@ entries here describe this plugin's OMP line only.
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-09-20
+
+### Changed
+
+- **Provider-owned request controls:** use OMP-provided session IDs and thinking budgets, snapshot endpoint candidates per request, and prefer only endpoints that have produced valid response content.
+- **Dynamic catalog fidelity:** consume backend context/output limits and capabilities, merge live metadata into static model families, resolve variant collisions deterministically, and keep project-specific runtime routes and model enums isolated.
+- **Account inspection:** bound quota inspection to three workers with a shared deadline while preserving account identity in timeout output.
+
+### Fixed
+
+- **Endpoint lifecycle:** keep plugin registration alive with invalid endpoint configuration, fail over transport-level stream errors, surface real catalog failures, and avoid concurrent catalog probes racing the sticky endpoint preference.
+- **Account eligibility:** stop OAuth login for explicitly ineligible free-tier accounts and retain the backend reason and validation URL.
+- **Streaming and messages:** avoid duplicate continuation bridges, route `max`/`xhigh` to the highest available tier, and preserve host-provided reasoning budgets.
+- **Image generation:** validate output paths before remote generation, stop retrying local save failures, and mark an endpoint successful only after valid image data is parsed.
+
+### Security
+
+- Write debug dumps and generated images through private, no-follow file descriptors to prevent final-path symlink and permission races.
+
+### Tests
+
+- Run the complete offline script suite from `bun run check` and add lifecycle regressions for stream failover, account isolation, conservative model metadata, and secure writes.
+
 ## [0.8.0] - 2026-09-19
 
 ### Added
