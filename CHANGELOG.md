@@ -8,42 +8,44 @@ entries here describe this plugin's OMP line only.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-19
+
 ### Added
 
+- **Native multi-account support:** Antigravity credentials participate in OMP's account pool with
+  per-session pinning, automatic quota-aware rotation, isolated project/model state, and
+  `/antigravity.accounts` for account selection and quota inspection.
 - **Normalized usage reporting:** the provider registers `ProviderConfig.usage`, so Antigravity quota
-  shows up in OMP's own usage surfaces instead of only through `/antigravity.usage`. One limit is
-  emitted per shared quota bucket (per-model rows repeat the same pool, so they are summarized in
-  `metadata` instead of duplicated), windows are classified into OMP's `5h` / `daily` / `weekly`
-  labels, and a failed fetch returns `null` so the host keeps its last-good report.
-- **`suppressWhenOff` thinking metadata:** models that already send `thinkingBudget: 0` when thinking
-  is off now say so declaratively, matching how Cloud Code Assist re-applies server-side defaults.
+  appears in OMP's native usage surfaces. Shared 5-hour, daily, and weekly pools are reported once
+  instead of duplicated per model, while failed refreshes preserve the host's last-good report.
+- **Regression coverage:** added Bun tests for endpoint retry policy, OAuth callback handling,
+  multi-account isolation, message pairing, image saves, cache recovery, and terminal formatting.
+
+### Changed
+
+- **Readable account quota display:** account, project, plan, model family, remaining percentage,
+  progress bar, and reset time now render on separate aligned lines, with clear active/inactive
+  markers and compact account-switching help.
+- **Unified provider transport:** userinfo and Antigravity API requests use the shared transport seam;
+  the obsolete usage `postJson` forwarding wrapper and private keep-alive dispatcher were removed.
+- **Thinking metadata:** models that already send `thinkingBudget: 0` when thinking is off now declare
+  `suppressWhenOff`, matching Cloud Code Assist's server-side default behavior.
 
 ### Fixed
 
-- **Emoji mangling:** `sanitizeText` replaced every surrogate code unit, so each valid pair was split
-  into two replacement characters — every emoji or astral-plane character in a user message, system
-  prompt, tool result, or image prompt was corrupted before reaching the backend. It now matches valid
-  pairs first and replaces only _lone_ surrogates (the invalid UTF-16 that strict JSON parsers reject).
-- **Effort precedence in runtime-model routing:** `{ reasoning: "high", disableReasoning: true }` routed
-  to the `-high` runtime model while sending `thinkingBudget: 0` — a thinking-tuned backend model asked
-  not to think. The runtime model is now selected through the same `resolveRequestedEffort` precedence
-  the generation config uses, and an explicit `ANTIGRAVITY_RUNTIME_MODEL` still overrides both.
-- **Unbounded model-discovery cache:** eviction only dropped entries that had _already_ expired, so a
-  session with many distinct (token, project, model) lookups grew the map without limit. It is now
-  capped at 64 entries, oldest first.
-- **Tool argument typing:** `generate_antigravity_image`'s `params` was collapsing to `unknown` because OMP's
-  injected `pi.zod` builder satisfies pi-ai's `TJsonSchema` branch rather than its `Type` branch, so
-  `Static<TParams>` could not infer. Arguments are now narrowed at a documented boundary. OMP's own
-  bundled `examples/extensions/hello.ts` hits the same gap.
-
-### Removed
-
-- **Private keep-alive dispatcher and the `undici` dependency.** The runtime is Bun
-  (`engines.bun`), where `process.versions.node` reports a Node 22+ compatibility version, so the
-  guard always skipped the custom Agent — and Node's bundled `fetch` rejects an npm `undici` Agent
-  outright while attaching one would bypass the host's proxy-aware dispatcher. Requests now go through
-  the host's `fetch`, with the load-time connection pre-warm (and `ANTIGRAVITY_NO_PREWARM`) kept.
-  `ANTIGRAVITY_HTTP2` and `ANTIGRAVITY_NO_KEEPALIVE` are gone with it.
+- **OAuth callback resilience:** malformed, prefetched, or state-mismatched callback requests return
+  HTTP 400 without cancelling the active login; explicit OAuth errors still reject immediately.
+  Manual callback prompts are cancellable, and loopback handling supports IPv4 and IPv6 safely.
+- **Discovery cache recovery:** failed project discovery is no longer cached, and project, model,
+  dynamic enum, diagnostics, and trajectory caches are bounded or scoped to prevent stale
+  cross-account state and unbounded growth.
+- **Streaming and message integrity:** preserve emoji surrogate pairs, pair tool results by
+  `toolCallId`, hash trajectory seeds, classify backend failures correctly, and keep
+  `disableReasoning` precedence consistent between runtime routing and generation config.
+- **Image and diagnostics safety:** retry only eligible image endpoints, harden generated-image path
+  validation, restrict debug dump permissions, and retain project-scoped diagnostics.
+- **Tool argument typing:** narrow image-tool arguments at the documented OMP schema boundary instead
+  of allowing `Static<TParams>` to collapse to `unknown`.
 
 ## [0.1.0]
 
