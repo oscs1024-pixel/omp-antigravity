@@ -1,6 +1,7 @@
 import { lstat, mkdir, realpath, writeFile } from "node:fs/promises";
 import { dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
+  AntigravityHttpError,
   antigravityHeaders,
   defaultProjectId,
   endpointCandidates,
@@ -9,7 +10,9 @@ import {
   loadCodeAssist,
   parseApiKey,
 } from "../client/client.js";
+import { ProviderHttpError } from "@oh-my-pi/pi-ai/error";
 import { AntigravityRequestType, AntigravityUserAgent, GeminiRole } from "../types/enums.js";
+import { streamChunkError } from "../stream/errors.js";
 import { antigravityFetch } from "../utils/http.js";
 import { safeError } from "../utils/security.js";
 import { antigravityRequestEnvelope, sanitizeText } from "../utils/util.js";
@@ -84,7 +87,7 @@ export type GenerateImageResult = {
 };
 
 type ImageStreamChunk = {
-  error?: { message?: string };
+  error?: { message?: string; code?: number; status?: string };
   response?: {
     candidates?: Array<{
       content?: {
@@ -172,10 +175,10 @@ export function resolveImageSavePath(
     ? resolve(root, requested.trim())
     : resolve(root, DEFAULT_IMAGE_DIR, defaultName);
   const rel = relative(root, target);
-  if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+  if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
     throw new Error("Image save path must be inside the working directory.");
   }
-  if (!extname(target)) return join(target, defaultName);
+  if (!rel || !extname(target)) return join(target, defaultName);
   if (index === undefined) return target;
   const currentExt = extname(target);
   return `${target.slice(0, -currentExt.length)}${suffix}${currentExt}`;
@@ -232,6 +235,7 @@ export async function collectImagesFromSse(
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let scanStart = 0;
   const images: GeneratedImage[] = [];
   const text: string[] = [];
   try {
@@ -241,9 +245,13 @@ export async function collectImagesFromSse(
       if (result.done) break;
       if (!(result.value instanceof Uint8Array)) continue;
       buffer += decoder.decode(result.value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-      for (const line of lines) {
+      // Incremental scan (same pattern as streamResponse): slice consumed lines
+      // off once per network chunk instead of re-splitting the whole buffer,
+      // which matters here because base64 image payloads are large.
+      let newlineIdx: number;
+      while ((newlineIdx = buffer.indexOf("\n", scanStart)) !== -1) {
+        const line = buffer.slice(scanStart, newlineIdx);
+        scanStart = newlineIdx + 1;
         if (!line.startsWith("data:")) continue;
         const json = line.slice(5).trim();
         if (!json || json === "[DONE]") continue;
@@ -253,11 +261,17 @@ export async function collectImagesFromSse(
         } catch {
           continue;
         }
-        if (chunk.error?.message) throw new Error(chunk.error.message);
+        if (chunk.error) {
+          throw streamChunkError(chunk.error);
+        }
         const responseData = chunk.response || chunk;
         for (const candidate of responseData.candidates || []) {
           collectImagesFromParts(candidate.content?.parts, images, text);
         }
+      }
+      if (scanStart > 0) {
+        buffer = buffer.slice(scanStart);
+        scanStart = 0;
       }
     }
   } finally {
@@ -333,9 +347,9 @@ export async function generateAntigravityImage(
           if (isRetryableEndpointStatus(response.status)) {
             continue;
           }
-          throw new Error(
-            `Antigravity image request failed (${response.status}): ${safeError(lastError)}`,
-          );
+          // Account-level failures (401/403/429, invalid request) can never succeed
+          // on another endpoint or image model — abort the fan-out entirely.
+          throw new AntigravityHttpError(safeError(lastError), response.status, endpoint);
         }
         const parsed = await collectImagesFromSse(response, options.signal);
         if (!parsed.images.length) {
@@ -360,10 +374,19 @@ export async function generateAntigravityImage(
         }
         return { images: parsed.images, savedPaths, text: parsed.text, model };
       } catch (error) {
-        lastError = safeError(error);
         if (options.signal?.aborted) {
           throw new Error("Request was aborted", { cause: error });
         }
+        // Account-level failures (401/403/429, bad request) can never succeed on
+        // another endpoint or image model — abort the fan-out entirely.
+        const status =
+          error instanceof AntigravityHttpError || error instanceof ProviderHttpError
+            ? error.status
+            : undefined;
+        if (status !== undefined && !isRetryableEndpointStatus(status)) {
+          throw error;
+        }
+        lastError = safeError(error);
       }
     }
   }

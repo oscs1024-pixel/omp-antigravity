@@ -172,7 +172,7 @@ export type StreamResponseData = {
 };
 
 export type StreamChunk = StreamResponseData & {
-  error?: { message?: string };
+  error?: { message?: string; code?: number; status?: string };
   response?: StreamResponseData;
 };
 

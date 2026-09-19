@@ -71,3 +71,27 @@ describe("mapStopReason", () => {
     assert.equal(mapStopReason(undefined), StopReason.Stop);
   });
 });
+
+describe("streamChunkError", () => {
+  it("recovers HTTP status from numeric error.code", async () => {
+    const { streamChunkError } = await import("../src/stream/errors.js");
+    const err = streamChunkError({
+      code: 429,
+      message: "Quota exceeded",
+      status: "RESOURCE_EXHAUSTED",
+    });
+    assert.equal(err.status, 429);
+  });
+
+  it("maps Google status string when code is absent", async () => {
+    const { streamChunkError } = await import("../src/stream/errors.js");
+    const err = streamChunkError({ status: "PERMISSION_DENIED", message: "denied" });
+    assert.equal(err.status, 403);
+  });
+
+  it("falls back to 500 for unclassified errors", async () => {
+    const { streamChunkError } = await import("../src/stream/errors.js");
+    const err = streamChunkError({ message: "something broke" });
+    assert.equal(err.status, 500);
+  });
+});
