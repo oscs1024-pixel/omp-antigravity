@@ -1,6 +1,9 @@
 import { antigravityEnv } from "./util.js";
 
-const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1", "localhost"]);
+// `::1` is intentionally excluded: the registered redirect URI is
+// `http://localhost:51121`, which browsers almost always resolve to 127.0.0.1 —
+// an IPv6-only bind would never receive the callback and the login would time out.
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost"]);
 const ALLOWED_API_HOST_SUFFIXES = [".googleapis.com", ".sandbox.googleapis.com"];
 
 /** Only loopback binds are allowed so OAuth codes cannot be stolen off-machine. */
@@ -8,7 +11,7 @@ export function resolveCallbackHost(raw = antigravityEnv("CALLBACK_HOST")): stri
   const host = (raw || "127.0.0.1").trim().toLowerCase();
   if (!LOOPBACK_HOSTS.has(host)) {
     throw new Error(
-      `Unsafe ANTIGRAVITY_CALLBACK_HOST="${host}". Only loopback hosts are allowed: 127.0.0.1, ::1, localhost.`,
+      `Unsafe ANTIGRAVITY_CALLBACK_HOST="${host}". Only loopback hosts are allowed: 127.0.0.1, localhost.`,
     );
   }
   return host === "localhost" ? "127.0.0.1" : host;

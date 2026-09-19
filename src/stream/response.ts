@@ -11,7 +11,7 @@ import type { ActiveBlock, StreamChunk } from "../types/types.js";
 import { PROVIDER_ID } from "../models/models.js";
 import { ANTIGRAVITY_API } from "./constants.js";
 import { applyUsageCost } from "./cost.js";
-import { mapStopReason } from "./errors.js";
+import { mapStopReason, streamChunkError } from "./errors.js";
 import {
   isPlanningLeakObject,
   isPlanningLeakPrefix,
@@ -199,14 +199,16 @@ export async function streamResponse(
       }
 
       if (chunk.error) {
-        throw new Error(chunk.error.message || JSON.stringify(chunk.error));
+        throw streamChunkError(chunk.error);
       }
 
       const responseData = chunk.response || chunk;
       const candidate = responseData.candidates?.[0];
 
       for (const part of candidate?.content?.parts || []) {
-        if (part.text !== undefined) {
+        // An empty text part carries no content and must not count as `received`
+        // — otherwise an all-empty-parts response would skip the empty retry.
+        if (part.text) {
           hasContent = true;
           const isThinking = part.thought === true;
           if (isThinking) {

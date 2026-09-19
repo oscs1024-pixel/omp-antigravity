@@ -1,3 +1,4 @@
+import { ProviderHttpError } from "@oh-my-pi/pi-ai/error";
 import { jsonOrTextError } from "../client/client.js";
 import { StopReason } from "../types/enums.js";
 import { redactSecrets } from "../utils/security.js";
@@ -106,4 +107,44 @@ export function friendlyAntigravityError(status: number | undefined, text: strin
   }
   if (status === 504) return "Antigravity timed out upstream. Next: retry in a moment.";
   return msg;
+}
+
+/** Google wire `status` strings mapped to their HTTP status code. */
+const GOOGLE_STATUS_TO_HTTP: Record<string, number> = {
+  INVALID_ARGUMENT: 400,
+  FAILED_PRECONDITION: 400,
+  OUT_OF_RANGE: 400,
+  UNAUTHENTICATED: 401,
+  PERMISSION_DENIED: 403,
+  NOT_FOUND: 404,
+  ALREADY_EXISTS: 409,
+  ABORTED: 409,
+  RESOURCE_EXHAUSTED: 429,
+  CANCELLED: 499,
+  INTERNAL: 500,
+  UNIMPLEMENTED: 501,
+  UNAVAILABLE: 503,
+  DEADLINE_EXCEEDED: 504,
+};
+
+/**
+ * Build a typed error from an SSE `error` chunk. Mid-stream errors arrive as
+ * data events rather than an HTTP status line, so the status has to be
+ * recovered from the payload (`error.code` numeric, or `error.status` like
+ * `RESOURCE_EXHAUSTED`) — otherwise downstream layers (including OMP's
+ * quota-based account rotation) cannot classify the failure.
+ */
+export function streamChunkError(error: {
+  message?: string;
+  code?: number;
+  status?: string;
+}): ProviderHttpError {
+  const message = redactSecrets(error.message || JSON.stringify(error)).slice(0, 500);
+  const status =
+    (typeof error.code === "number" && error.code >= 400 && error.code < 600 && error.code) ||
+    (error.status ? GOOGLE_STATUS_TO_HTTP[error.status] : undefined) ||
+    500;
+  return new ProviderHttpError(`Antigravity stream error: ${message}`, status, {
+    code: error.status,
+  });
 }

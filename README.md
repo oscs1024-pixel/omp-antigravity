@@ -502,7 +502,7 @@ Antigravity 平台提供跨厂商的多模型支持。插件将各模型折叠�
 | --------------------------------------- | ------------- | ----------------------------------------------------------------------------------------------------------------------- |
 | `ANTIGRAVITY_BASE_URL`                  | -             | 覆盖默认 API 基址（必须为合法且受信任的 Google HTTPS 域名）。                                                           |
 | `ANTIGRAVITY_PROJECT_ID`                | -             | 显式指定 Cloud Code Assist 项目 ID，跳过自动项目发现 round-trip。                                                       |
-| `ANTIGRAVITY_CALLBACK_HOST`             | `127.0.0.1`   | OAuth 本地监听绑定地址（仅限 `127.0.0.1`、`::1` 或 `localhost`）。                                                      |
+| `ANTIGRAVITY_CALLBACK_HOST`             | `127.0.0.1`   | OAuth 本地监听绑定地址（仅限 `127.0.0.1` 或 `localhost`）。                                                             |
 | `ANTIGRAVITY_RUNTIME_MODEL`             | -             | 强制锁定所有请求至特定的底层 runtime model ID。                                                                         |
 | `ANTIGRAVITY_CLIENT_ID`                 | 官方默认值    | 自定义 Google OAuth 客户端 ID。                                                                                         |
 | `ANTIGRAVITY_CLIENT_SECRET`             | 官方默认值    | 自定义 Google OAuth 客户端密钥。                                                                                        |

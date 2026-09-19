@@ -193,10 +193,13 @@ export function streamAntigravity(
               } catch {
                 parsedBody = body;
               }
-              await (
-                await import("node:fs/promises")
-              ).writeFile(
-                "/tmp/antigravity-last-request.json",
+              const fsp = await import("node:fs/promises");
+              const dumpPath = "/tmp/antigravity-last-request.json";
+              // mode applies only on creation — chmod covers a pre-existing dump
+              // written with wider permissions. The body contains full
+              // conversation text, so it must not be world-readable.
+              await fsp.writeFile(
+                dumpPath,
                 JSON.stringify(
                   {
                     status: response?.status,
@@ -207,7 +210,9 @@ export function streamAntigravity(
                   null,
                   2,
                 ),
+                { mode: 0o600 },
               );
+              await fsp.chmod(dumpPath, 0o600);
             } catch {
               // ignore dump failures
             }
