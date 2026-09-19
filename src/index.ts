@@ -314,7 +314,7 @@ export default function (pi: ExtensionAPI): void {
             }),
             { signal: inspectionDeadline.signal },
           );
-          const quotaLines = formatAccountQuotaSummary(usage)
+          const quotaLines = formatAccountQuotaSummary(usage, { useColor })
             .split("\n")
             .map((line) => `      ${line}`)
             .join("\n");
@@ -369,7 +369,8 @@ export default function (pi: ExtensionAPI): void {
   pi.registerCommand("antigravity.usage", {
     description: "Show Antigravity shared quota pools (Gemini / Claude+GPT, 5h + weekly)",
     handler: async (_args, ctx) => {
-      await withUsage(ctx, formatUsageSummary);
+      const useColor = ctx.hasUI || Boolean(process.stdout?.isTTY);
+      await withUsage(ctx, (usage) => formatUsageSummary(usage, { useColor }));
     },
   });
   pi.registerCommand("antigravity.models", {

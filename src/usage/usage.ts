@@ -45,13 +45,29 @@ function remainingPercent(remaining?: number): number | undefined {
   if (remaining === undefined) return undefined;
   return Math.round(remaining * 1000) / 10;
 }
-
-function progressBar(remaining?: number, width = 20): string {
-  if (remaining === undefined) return `[${"?".repeat(width)}]`;
-  const filled = Math.max(0, Math.min(width, Math.round(remaining * width)));
-  return `[${"#".repeat(filled)}${"-".repeat(width - filled)}]`;
+function formatHealthColor(remainingFraction: number, text: string): string {
+  if (remainingFraction === 0) return `\x1b[1;31m${text}\x1b[0m`;
+  if (remainingFraction < 0.2) return `\x1b[31m${text}\x1b[0m`;
+  if (remainingFraction < 0.5) return `\x1b[33m${text}\x1b[0m`;
+  return `\x1b[32m${text}\x1b[0m`;
 }
 
+function progressBar(remaining?: number, width = 20, useColor = false): string {
+  if (remaining === undefined) {
+    return useColor ? `\x1b[90m[${"?".repeat(width)}]\x1b[0m` : `[${"?".repeat(width)}]`;
+  }
+  const filled = Math.max(0, Math.min(width, Math.round(remaining * width)));
+  const empty = width - filled;
+
+  if (!useColor) {
+    return `[${"#".repeat(filled)}${"-".repeat(empty)}]`;
+  }
+
+  const filledChars = "█".repeat(filled);
+  const emptyChars = "░".repeat(empty);
+  const coloredFilled = formatHealthColor(remaining, filledChars);
+  return `[${coloredFilled}\x1b[90m${emptyChars}\x1b[0m]`;
+}
 function formatReset(resetTime?: string): string {
   if (!resetTime) return "n/a";
   const ts = Date.parse(resetTime);
@@ -276,10 +292,20 @@ function quotaErrorNote(msg: string): string {
   return `Aggregate quota summary unavailable: ${msg.slice(0, 160)}`;
 }
 
-export function formatUsageSummary(usage: AccountUsage): string {
+export interface FormatAccountQuotaOptions {
+  useColor?: boolean;
+}
+
+export function formatUsageSummary(
+  usage: AccountUsage,
+  options: FormatAccountQuotaOptions = {},
+): string {
+  const useColor = options.useColor ?? false;
   const lines: string[] = [];
 
-  if (usage.planLabel) lines.push(usage.planLabel);
+  if (usage.planLabel) {
+    lines.push(useColor ? `\x1b[90mPlan:\x1b[0m ${usage.planLabel}` : usage.planLabel);
+  }
 
   if (!usage.groups.length) {
     if (usage.quotaSummaryError) {
@@ -292,21 +318,32 @@ export function formatUsageSummary(usage: AccountUsage): string {
 
   for (const group of usage.groups) {
     if (lines.length) lines.push("");
-    lines.push(group.displayName);
+    lines.push(useColor ? `\x1b[1m${group.displayName}\x1b[0m` : group.displayName);
     for (const bucket of group.buckets) {
       const rem = remainingPercent(bucket.remainingFraction);
-      lines.push(
-        `  ${progressBar(bucket.remainingFraction)} ${bucket.displayName}: ${rem ?? "?"}% left · resets ${formatReset(bucket.resetTime)}`,
-      );
+      const remText = rem !== undefined ? `${rem}%` : "?";
+      const remColored = useColor ? formatHealthColor(bucket.remainingFraction, remText) : remText;
+      const bar = progressBar(bucket.remainingFraction, 20, useColor);
+      const resetText = bucket.resetTime
+        ? useColor
+          ? ` · \x1b[90mresets in\x1b[0m ${formatReset(bucket.resetTime)}`
+          : ` · resets ${formatReset(bucket.resetTime)}`
+        : "";
+      lines.push(`  ${bar} ${bucket.displayName}: ${remColored} left${resetText}`);
     }
   }
 
   return lines.join("\n").trimEnd();
 }
-export function formatAccountQuotaSummary(usage: AccountUsage): string {
+
+export function formatAccountQuotaSummary(
+  usage: AccountUsage,
+  options: FormatAccountQuotaOptions = {},
+): string {
+  const useColor = options.useColor ?? false;
   const lines: string[] = [];
   if (usage.planLabel) {
-    lines.push(`Plan: ${usage.planLabel}`);
+    lines.push(useColor ? `\x1b[90mPlan:\x1b[0m ${usage.planLabel}` : `Plan: ${usage.planLabel}`);
   }
 
   for (const group of usage.groups) {
@@ -318,7 +355,7 @@ export function formatAccountQuotaSummary(usage: AccountUsage): string {
       .replace(/\s*(?:and|&)\s+other\b/i, "/Other")
       .trim();
     if (groupLabel && !/quota\s*group/i.test(rawGroup)) {
-      lines.push(groupLabel);
+      lines.push(useColor ? `\x1b[1m${groupLabel}\x1b[0m` : groupLabel);
     }
 
     const buckets = group.buckets.map((bucket) => {
@@ -332,13 +369,25 @@ export function formatAccountQuotaSummary(usage: AccountUsage): string {
             : rawLabel.replace(/\s+limit\s+remaining$/i, "");
       return { bucket, label };
     });
+
+    // Display short-term window (5h, Daily) before long-term (Weekly)
+    const windowPriority: Record<string, number> = { "5h": 1, Daily: 2, Weekly: 3 };
+    buckets.sort((a, b) => (windowPriority[a.label] ?? 99) - (windowPriority[b.label] ?? 99));
+
     const labelWidth = Math.max(...buckets.map(({ label }) => label.length));
 
     for (const { bucket, label } of buckets) {
-      const percent = `${Math.round(bucket.remainingFraction * 100)}%`.padStart(4);
-      const reset = bucket.resetTime ? `  resets ${formatReset(bucket.resetTime)}` : "";
+      const rawPercent = `${Math.round(bucket.remainingFraction * 100)}%`.padStart(4);
+      const percentStr = useColor
+        ? `${formatHealthColor(bucket.remainingFraction, rawPercent)} left`
+        : `${rawPercent} left`;
+      const reset = bucket.resetTime
+        ? useColor
+          ? `  \x1b[90mresets in\x1b[0m ${formatReset(bucket.resetTime)}`
+          : `  resets ${formatReset(bucket.resetTime)}`
+        : "";
       lines.push(
-        `  ${label.padEnd(labelWidth)}  ${percent} left  ${progressBar(bucket.remainingFraction, 10)}${reset}`,
+        `  ${label.padEnd(labelWidth)}  ${percentStr}  ${progressBar(bucket.remainingFraction, 10, useColor)}${reset}`,
       );
     }
   }
@@ -351,20 +400,28 @@ export function formatAccountQuotaSummary(usage: AccountUsage): string {
     usage.validationUrl ||
     /VALIDATION_REQUIRED|verify your account/i.test(usage.quotaSummaryError || "")
   ) {
+    const prefix = useColor
+      ? "\x1b[31mAccount verification required:\x1b[0m"
+      : "Account verification required:";
     lines.push(
       usage.validationUrl
-        ? `Account verification required: ${usage.validationUrl}`
+        ? `${prefix} ${usage.validationUrl}`
         : "Account verification required (Google human verification challenge)",
     );
   } else if (
     usage.quotaSummaryError &&
     /SUBSCRIPTION_REQUIRED|#3501/i.test(usage.quotaSummaryError)
   ) {
-    lines.push("Free Tier (quota summary requires paid subscription)");
+    lines.push(
+      useColor
+        ? "\x1b[90mFree Tier (quota summary requires paid subscription)\x1b[0m"
+        : "Free Tier (quota summary requires paid subscription)",
+    );
   } else if (usage.quotaSummaryError) {
-    lines.push(`Quota unavailable: ${usage.quotaSummaryError.slice(0, 100)}`);
+    const prefix = useColor ? "\x1b[31mQuota unavailable:\x1b[0m" : "Quota unavailable:";
+    lines.push(`${prefix} ${usage.quotaSummaryError.slice(0, 100)}`);
   } else {
-    lines.push("Quota available");
+    lines.push(useColor ? "\x1b[32mQuota available\x1b[0m" : "Quota available");
   }
 
   return lines.join("\n");

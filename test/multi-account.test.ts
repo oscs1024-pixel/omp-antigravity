@@ -458,6 +458,40 @@ describe("formatAccountQuotaSummary", () => {
     assert.ok(summary.includes("Account verification required:"));
     assert.ok(summary.includes("https://accounts.google.com/signin/continue"));
   });
+  it("renders colored ANSI blocks and health indicators when useColor is enabled", () => {
+    const usage: AccountUsage = {
+      projectId: "proj-color",
+      endpoint: "https://daily-cloudcode-pa.googleapis.com",
+      planLabel: "Google AI Pro",
+      groups: [
+        {
+          displayName: "Gemini models",
+          buckets: [
+            {
+              bucketId: "5h",
+              displayName: "5h",
+              remainingFraction: 0.85,
+              resetTime: new Date(Date.now() + 3600000).toISOString(),
+            },
+            {
+              bucketId: "weekly",
+              displayName: "Weekly",
+              remainingFraction: 0.12,
+              resetTime: new Date(Date.now() + 86400000).toISOString(),
+            },
+          ],
+        },
+      ],
+      models: [],
+      fetchedAt: Date.now(),
+    };
+
+    const colored = formatAccountQuotaSummary(usage, { useColor: true });
+    assert.ok(colored.includes("\x1b[32m")); // Green for 85%
+    assert.ok(colored.includes("\x1b[31m")); // Red for 12%
+    assert.ok(colored.includes("█")); // Modern Unicode block
+    assert.ok(colored.includes("░")); // Modern background block
+  });
 });
 
 describe("extension registration", () => {
