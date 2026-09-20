@@ -53,7 +53,10 @@ export function asToolCallArguments(
  * the `AssistantMessage` because OMP's message contract has no field for it.
  */
 export type StreamResponseResult = {
+  /** At least one user-consumable text delta or tool call was emitted. */
   received: boolean;
+  /** The provider sent non-empty model content, even if it was suppressed as internal-only. */
+  wireReceived: boolean;
   rawStopReason?: string;
   responseId?: string;
 };
@@ -75,7 +78,9 @@ export async function streamResponse(
   let scanStart = 0;
   let started = false;
   let currentBlock: ActiveBlock | null = null;
-  let hasContent = false;
+  let currentBlockStarted = false;
+  let wireReceived = false;
+  let hasConsumableContent = false;
   let rawStopReason: string | undefined;
   let lastResponseId: string | undefined;
   const blocks = output.content;
@@ -93,11 +98,37 @@ export async function streamResponse(
     }
   };
 
+  const revealDeferredThinking = () => {
+    if (!currentBlock || currentBlock.type !== "thinking" || currentBlockStarted) return;
+    ensureStarted();
+    currentBlockStarted = true;
+    stream.push({
+      type: "thinking_start",
+      contentIndex: blockIndex(),
+      partial: output,
+    });
+    if (currentBlock.thinking) {
+      stream.push({
+        type: "thinking_delta",
+        contentIndex: blockIndex(),
+        delta: currentBlock.thinking,
+        partial: output,
+      });
+    }
+  };
+
+  const markConsumable = () => {
+    hasConsumableContent = true;
+    revealDeferredThinking();
+  };
+
   const emitTextDelta = (delta: string, thoughtSignature?: string) => {
     if (!delta) return;
+    markConsumable();
     if (!currentBlock || currentBlock.type !== "text") {
       finishCurrent();
       currentBlock = { type: "text", text: "" };
+      currentBlockStarted = true;
       blocks.push(currentBlock);
       ensureStarted();
       stream.push({
@@ -159,6 +190,14 @@ export async function streamResponse(
   const finishCurrent = () => {
     flushTextBuffer(true);
     if (!currentBlock) return;
+    if (!currentBlockStarted) {
+      // Thinking-only/internal-only attempts are not published. Remove the
+      // deferred block so the caller can safely retry without leaving ghost
+      // content in the partial AssistantMessage.
+      if (blocks.at(-1) === currentBlock) blocks.pop();
+      currentBlock = null;
+      return;
+    }
     if (currentBlock.type === "text") {
       stream.push({
         type: "text_end",
@@ -175,6 +214,7 @@ export async function streamResponse(
       });
     }
     currentBlock = null;
+    currentBlockStarted = false;
   };
 
   while (true) {
@@ -210,33 +250,39 @@ export async function streamResponse(
       const candidate = responseData.candidates?.[0];
 
       for (const part of candidate?.content?.parts || []) {
-        // An empty text part carries no content and must not count as `received`
-        // — otherwise an all-empty-parts response would skip the empty retry.
+        // Track provider-wire content separately from what we actually publish.
+        // A thinking-only response or an internal planning JSON leak should not
+        // suppress the caller's empty-response retry.
         if (part.text) {
-          hasContent = true;
+          wireReceived = true;
           const isThinking = part.thought === true;
           if (isThinking) {
             flushTextBuffer(true);
             if (!currentBlock || currentBlock.type !== "thinking") {
               finishCurrent();
               currentBlock = { type: "thinking", thinking: "", thinkingSignature: undefined };
+              currentBlockStarted = hasConsumableContent;
               blocks.push(currentBlock);
-              ensureStarted();
-              stream.push({
-                type: "thinking_start",
-                contentIndex: blockIndex(),
-                partial: output,
-              });
+              if (currentBlockStarted) {
+                ensureStarted();
+                stream.push({
+                  type: "thinking_start",
+                  contentIndex: blockIndex(),
+                  partial: output,
+                });
+              }
             }
             if (currentBlock.type === "thinking") {
               currentBlock.thinking += part.text;
               if (part.thoughtSignature) currentBlock.thinkingSignature = part.thoughtSignature;
-              stream.push({
-                type: "thinking_delta",
-                contentIndex: blockIndex(),
-                delta: part.text,
-                partial: output,
-              });
+              if (currentBlockStarted) {
+                stream.push({
+                  type: "thinking_delta",
+                  contentIndex: blockIndex(),
+                  delta: part.text,
+                  partial: output,
+                });
+              }
             }
           } else {
             if (isBufferingText) {
@@ -254,7 +300,8 @@ export async function streamResponse(
         }
 
         if (part.functionCall) {
-          hasContent = true;
+          wireReceived = true;
+          markConsumable();
           flushTextBuffer(true);
           finishCurrent();
           const rawId = part.functionCall.id || "";
@@ -323,5 +370,10 @@ export async function streamResponse(
 
   flushTextBuffer(true);
   finishCurrent();
-  return { received: hasContent, rawStopReason, responseId: lastResponseId };
+  return {
+    received: hasConsumableContent,
+    wireReceived,
+    rawStopReason,
+    responseId: lastResponseId,
+  };
 }

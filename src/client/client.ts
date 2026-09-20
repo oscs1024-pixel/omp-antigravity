@@ -123,6 +123,8 @@ export interface PostJsonOptions {
   headers?: Record<string, string>;
   /** Internal: callers aggregating parallel endpoints select the winner explicitly. */
   recordSuccess?: boolean;
+  /** Internal: parallel probes must not race the shared diagnostics snapshot. */
+  recordDiagnostics?: boolean;
 }
 
 export interface PostJsonResponse<T = unknown> {
@@ -194,8 +196,10 @@ async function requestEndpointJson<T = unknown>(
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     signal,
   });
-  setLastEndpoint(endpoint);
-  setLastStatus(res.status);
+  if (options.recordDiagnostics !== false) {
+    setLastEndpoint(endpoint);
+    setLastStatus(res.status);
+  }
 
   const text = await res.text();
   let data: unknown;
@@ -208,7 +212,7 @@ async function requestEndpointJson<T = unknown>(
   if (!res.ok) {
     const errorBody = isRecord(data) ? (data as { error?: { message?: string } }) : undefined;
     const message = typeof errorBody?.error?.message === "string" ? errorBody.error.message : text;
-    setLastError(message);
+    if (options.recordDiagnostics !== false) setLastError(message);
     throw new AntigravityHttpError(
       `${path} failed (${String(res.status)}): ${message.slice(0, 300)}`,
       res.status,
@@ -358,10 +362,7 @@ async function listCloudAICompanionProjects(
   signal?: AbortSignal,
 ): Promise<string | undefined> {
   try {
-    const primaryEndpoint = endpointCandidates()[0];
-    if (!primaryEndpoint) return undefined;
-    const res = await postEndpointJson(
-      primaryEndpoint,
+    const res = await postAntigravityJson(
       "/v1internal:listCloudAICompanionProjects",
       token,
       {},
@@ -591,8 +592,12 @@ export async function fetchAvailableRuntimeModel(
 }
 
 type AvailableModelsAttempt =
-  | { result: { endpoint: string; status: number; data: unknown }; error?: never }
-  | { result?: never; error: unknown };
+  | {
+      endpoint: string;
+      result: { endpoint: string; status: number; data: unknown };
+      error?: never;
+    }
+  | { endpoint: string; result?: never; error: unknown };
 
 async function fetchAvailableModelsFromEndpoint(
   endpoint: string,
@@ -602,17 +607,22 @@ async function fetchAvailableModelsFromEndpoint(
 ): Promise<AvailableModelsAttempt> {
   try {
     return {
+      endpoint,
       result: await postEndpointJson(
         endpoint,
         "/v1internal:fetchAvailableModels",
         token,
         { project: projectId },
-        { signal, timeoutMs: DISCOVERY_TIMEOUT_MS, recordSuccess: false },
+        {
+          signal,
+          timeoutMs: DISCOVERY_TIMEOUT_MS,
+          recordSuccess: false,
+          recordDiagnostics: false,
+        },
       ),
     };
   } catch (error) {
-    setLastError(safeError(error));
-    return { error };
+    return { endpoint, error };
   }
 }
 
@@ -680,8 +690,12 @@ export async function fetchAvailableModelsCatalog(
   const results = attempts.flatMap((attempt) => (attempt.result ? [attempt.result] : []));
   if (results.length === 0) {
     for (let index = attempts.length - 1; index >= 0; index -= 1) {
-      const error = attempts[index]?.error;
+      const attempt = attempts[index];
+      const error = attempt?.error;
       if (error !== undefined) {
+        setLastEndpoint(attempt.endpoint);
+        setLastStatus(error instanceof AntigravityHttpError ? error.status : undefined);
+        setLastError(safeError(error));
         throw error instanceof Error ? error : new Error(safeError(error));
       }
     }

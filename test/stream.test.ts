@@ -105,6 +105,120 @@ describe("streamAntigravity endpoint lifecycle", () => {
     }
   });
 
+  it("retries when the only wire text is a filtered planning leak", async () => {
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls++;
+      if (calls === 1) {
+        const payload = {
+          response: {
+            candidates: [
+              {
+                content: { parts: [{ text: '{"thought":"internal planning"}' }] },
+                finishReason: "STOP",
+              },
+            ],
+          },
+        };
+        return new Response(`data: ${JSON.stringify(payload)}\n`, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        });
+      }
+      return successfulSseResponse();
+    }) as typeof fetch;
+
+    try {
+      const events: Array<{ type: string; delta?: string }> = [];
+      for await (const event of streamAntigravity(model, context, { apiKey })) {
+        events.push(event as { type: string; delta?: string });
+      }
+      assert.equal(calls, 2);
+      assert.ok(events.some((event) => event.type === "text_delta" && event.delta === "ok"));
+      assert.ok(
+        !events.some((event) => event.delta?.includes("internal planning")),
+        "filtered planning JSON must never be emitted",
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("retries thinking-only attempts without publishing ghost thinking events", async () => {
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls++;
+      if (calls === 1) {
+        const payload = {
+          response: {
+            candidates: [
+              {
+                content: { parts: [{ text: "private reasoning only", thought: true }] },
+                finishReason: "STOP",
+              },
+            ],
+          },
+        };
+        return new Response(`data: ${JSON.stringify(payload)}\n`, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        });
+      }
+      return successfulSseResponse();
+    }) as typeof fetch;
+
+    try {
+      const events: Array<{ type: string; delta?: string }> = [];
+      for await (const event of streamAntigravity(model, context, { apiKey })) {
+        events.push(event as { type: string; delta?: string });
+      }
+      assert.equal(calls, 2);
+      assert.ok(events.some((event) => event.type === "text_delta" && event.delta === "ok"));
+      assert.ok(!events.some((event) => event.type.startsWith("thinking_")));
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("preserves thinking blocks that arrive after consumable text", async () => {
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls++;
+      const payload = {
+        response: {
+          candidates: [
+            {
+              content: {
+                parts: [{ text: "answer" }, { text: "post-answer reasoning", thought: true }],
+              },
+              finishReason: "STOP",
+            },
+          ],
+        },
+      };
+      return new Response(`data: ${JSON.stringify(payload)}\n`, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    }) as typeof fetch;
+
+    try {
+      const events: Array<{ type: string; delta?: string }> = [];
+      for await (const event of streamAntigravity(model, context, { apiKey })) {
+        events.push(event as { type: string; delta?: string });
+      }
+      assert.equal(calls, 1);
+      assert.ok(events.some((event) => event.type === "text_delta" && event.delta === "answer"));
+      assert.ok(
+        events.some(
+          (event) => event.type === "thinking_delta" && event.delta === "post-answer reasoning",
+        ),
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it("re-discovers a real project from placeholder credentials", async () => {
     const previousProject = process.env.ANTIGRAVITY_PROJECT_ID;
     delete process.env.ANTIGRAVITY_PROJECT_ID;

@@ -15,6 +15,7 @@ import {
   resetEndpointPreferenceForTests,
   type PostJsonResponse,
 } from "../src/client/client.js";
+import { getLastDiagnostics, resetDiagnosticsForTests } from "../src/diagnostics/diagnostics.js";
 
 describe("buildModelMatchRegex", () => {
   describe("special aliases", () => {
@@ -280,6 +281,41 @@ describe("catalog endpoint failures", () => {
       resetEndpointPreferenceForTests();
     }
   });
+
+  it("does not leave a failed parallel probe in doctor diagnostics after catalog success", async () => {
+    resetDiagnosticsForTests();
+    resetEndpointPreferenceForTests();
+    const candidates = endpointCandidates();
+    globalThis.fetch = (async (input: string | URL) => {
+      const url = String(input);
+      if (url.startsWith(candidates[0]!)) {
+        return new Response(JSON.stringify({ error: { message: "temporary catalog failure" } }), {
+          status: 503,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ models: {} }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as typeof fetch;
+
+    try {
+      const result = await fetchAvailableModelsCatalog(
+        "catalog-diagnostics-token",
+        "diagnostics-project",
+      );
+      const diagnostics = getLastDiagnostics();
+      assert.equal(result.status, 200);
+      assert.equal(diagnostics.status, 200);
+      assert.equal(diagnostics.endpoint, result.endpoint);
+      assert.equal(diagnostics.error, undefined);
+    } finally {
+      globalThis.fetch = originalFetch;
+      resetEndpointPreferenceForTests();
+      resetDiagnosticsForTests();
+    }
+  });
 });
 
 describe("endpoint preference", () => {
@@ -295,6 +331,45 @@ describe("endpoint preference", () => {
 
 describe("loadCodeAssist project cache", () => {
   const originalFetch = globalThis.fetch;
+
+  it("falls back across endpoints when listCloudAICompanionProjects primary fails", async () => {
+    resetEndpointPreferenceForTests();
+    const candidates = endpointCandidates();
+    const listRequests: string[] = [];
+    globalThis.fetch = (async (input: string | URL) => {
+      const url = String(input);
+      if (url.includes("/v1internal:loadCodeAssist")) {
+        return new Response(JSON.stringify({ currentTier: { id: "free-tier" } }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (url.includes("/v1internal:listCloudAICompanionProjects")) {
+        listRequests.push(url);
+        if (url.startsWith(candidates[0]!)) {
+          return new Response(JSON.stringify({ error: { message: "temporary" } }), {
+            status: 503,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response(JSON.stringify({ projectId: "project-from-fallback" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    }) as typeof fetch;
+
+    try {
+      assert.equal(await loadCodeAssist("project-list-fallback-token"), "project-from-fallback");
+      assert.equal(listRequests.length, 2);
+      assert.ok(listRequests[0]!.startsWith(candidates[0]!));
+      assert.ok(listRequests[1]!.startsWith(candidates[1]!));
+    } finally {
+      globalThis.fetch = originalFetch;
+      resetEndpointPreferenceForTests();
+    }
+  });
 
   it("recovers on the next discovery call after a transient failure", async () => {
     let attempt = 0;

@@ -429,6 +429,44 @@ const ANTIGRAVITY_MODEL_ENUM: Record<string, string> = {
 const unscopedModelEnumCache = new Map<string, string>();
 const modelEnumsByProject = new Map<string, Map<string, string>>();
 
+/**
+ * Remove one account/project's dynamic catalog and discovered enum cache.
+ *
+ * Static seed models remain available through ANTIGRAVITY_MODELS/ROUTING.
+ */
+export function clearAntigravityProjectCatalog(projectId: string): boolean {
+  const key = projectId.trim();
+  if (!key) return false;
+  const removedCatalog = catalogsByProject.delete(key);
+  const removedEnums = modelEnumsByProject.delete(key);
+  if (removedCatalog) rebuildCurrentCatalog();
+  return removedCatalog || removedEnums;
+}
+
+/**
+ * Reconcile project-scoped dynamic state against the projects still owned by the
+ * host auth store. Used after logout/account removal because OMP exposes no
+ * provider-auth-change hook to extensions.
+ */
+export function retainAntigravityProjectCatalogs(projectIds: Iterable<string>): boolean {
+  const keep = new Set(Array.from(projectIds, (id) => id.trim()).filter(Boolean));
+  let changed = false;
+  for (const projectId of [...catalogsByProject.keys()]) {
+    if (keep.has(projectId)) continue;
+    catalogsByProject.delete(projectId);
+    modelEnumsByProject.delete(projectId);
+    changed = true;
+  }
+  for (const projectId of [...modelEnumsByProject.keys()]) {
+    if (!keep.has(projectId)) {
+      modelEnumsByProject.delete(projectId);
+      changed = true;
+    }
+  }
+  if (changed) rebuildCurrentCatalog();
+  return changed;
+}
+
 function modelEnumCacheFor(projectId: string | undefined): Map<string, string> {
   if (!projectId) return unscopedModelEnumCache;
   const existing = modelEnumsByProject.get(projectId);
