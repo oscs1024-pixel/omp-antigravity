@@ -1,4 +1,5 @@
-import { lstat, mkdir, realpath } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { lstat, mkdir, open, realpath, type FileHandle } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   AntigravityHttpError,
@@ -371,10 +372,83 @@ async function ensureSafeImageDirectory(cwd: string, filePath: string): Promise<
   return current;
 }
 
+const PROC_FD_ROOT = "/proc/self/fd";
+
+function procFdPath(handle: FileHandle, child?: string): string {
+  const base = join(PROC_FD_ROOT, String(handle.fd));
+  return child ? join(base, child) : base;
+}
+
+async function openNoFollowDirectory(path: string): Promise<FileHandle> {
+  return open(path, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+}
+
+/**
+ * Linux hardening path: traverse/create every directory relative to an already
+ * opened directory descriptor exposed through /proc/self/fd. Once a parent is
+ * open, renaming/replacing its pathname cannot redirect later child resolution.
+ *
+ * Node/Bun do not expose openat(2) directly. /proc/self/fd provides equivalent
+ * anchoring on Linux; non-Linux hosts fall back to the path-based no-follow
+ * checks below.
+ */
+async function openAnchoredImageDirectory(
+  cwd: string,
+  filePath: string,
+): Promise<FileHandle | undefined> {
+  if (process.platform !== "linux") return undefined;
+
+  const { root, segments } = await imageDirectorySegments(cwd, filePath);
+  let current = await openNoFollowDirectory(root);
+  try {
+    // Some restricted Linux containers do not mount procfs. Detect that before
+    // relying on the descriptor path and use the portable fallback instead.
+    try {
+      await lstat(procFdPath(current));
+    } catch {
+      await current.close();
+      return undefined;
+    }
+
+    for (const segment of segments) {
+      const childPath = procFdPath(current, segment);
+      let next: FileHandle;
+      try {
+        next = await openNoFollowDirectory(childPath);
+      } catch (error) {
+        if (fsErrorCode(error) !== "ENOENT") throw error;
+        try {
+          await mkdir(childPath, { mode: 0o700 });
+        } catch (mkdirError) {
+          if (fsErrorCode(mkdirError) !== "EEXIST") throw mkdirError;
+        }
+        next = await openNoFollowDirectory(childPath);
+      }
+      await current.close();
+      current = next;
+    }
+    return current;
+  } catch (error) {
+    await current.close().catch(() => undefined);
+    throw error;
+  }
+}
+
 async function writeImage(cwd: string, filePath: string, image: GeneratedImage): Promise<string> {
+  const data = Buffer.from(image.data, "base64");
+  const anchoredDir = await openAnchoredImageDirectory(cwd, filePath);
+  if (anchoredDir) {
+    try {
+      await writePrivateFileNoFollow(procFdPath(anchoredDir, basename(filePath)), data);
+      return filePath;
+    } finally {
+      await anchoredDir.close();
+    }
+  }
+
   const realDir = await ensureSafeImageDirectory(cwd, filePath);
   const realTarget = join(realDir, basename(filePath));
-  await writePrivateFileNoFollow(realTarget, Buffer.from(image.data, "base64"));
+  await writePrivateFileNoFollow(realTarget, data);
   return filePath;
 }
 

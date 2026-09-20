@@ -239,6 +239,8 @@ export type AccountUsage = {
   quotaSummaryError?: string;
   /** Set when Google returns VALIDATION_REQUIRED with an account verification URL. */
   validationUrl?: string;
+  /** Best-effort dynamic model catalog failure; aggregate quota may still be usable. */
+  modelCatalogError?: string;
   models: ModelQuotaRow[];
   defaultAgentModelId?: string;
   fetchedAt: number;

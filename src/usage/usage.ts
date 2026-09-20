@@ -10,6 +10,7 @@ import type {
 import type { ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
 import {
   AntigravityHttpError,
+  DEFAULT_ENDPOINT,
   DISCOVERY_TIMEOUT_MS,
   extractProjectId,
   fetchAvailableModelsCatalog,
@@ -177,6 +178,27 @@ async function loadCodeAssistSafe(token: string, signal?: AbortSignal) {
   }
 }
 
+type AvailableModelsSafeResult = {
+  projectId: string;
+  result?: Awaited<ReturnType<typeof fetchAvailableModelsCatalog>>;
+  error?: string;
+};
+
+async function fetchAvailableModelsSafe(
+  token: string,
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<AvailableModelsSafeResult> {
+  try {
+    return {
+      projectId,
+      result: await fetchAvailableModelsCatalog(token, projectId, signal),
+    };
+  } catch (error) {
+    return { projectId, error: safeError(error) };
+  }
+}
+
 /**
  * The user-quota-summary RPC is gated behind a paid subscription: free-tier
  * accounts get 403 SUBSCRIPTION_REQUIRED (#3501). It is best-effort diagnostics
@@ -239,10 +261,7 @@ export async function fetchAccountUsage(
   const summaryPromise = fetchQuotaSummarySafe(creds.token, signal);
   const availablePromise = (async () => {
     if (credentialProjectId) {
-      return {
-        projectId: credentialProjectId,
-        result: await fetchAvailableModelsCatalog(creds.token, credentialProjectId, signal),
-      };
+      return fetchAvailableModelsSafe(creds.token, credentialProjectId, signal);
     }
     const assist = await assistPromise;
     const discoveredProject = assist ? extractProjectId(assist.data) : undefined;
@@ -250,10 +269,7 @@ export async function fetchAccountUsage(
       warmedProject: discoveredProject ?? null,
       credentialProjectId,
     });
-    return {
-      projectId,
-      result: await fetchAvailableModelsCatalog(creds.token, projectId, signal),
-    };
+    return fetchAvailableModelsSafe(creds.token, projectId, signal);
   })();
 
   const [assistResult, summaryRes, initialAvailable] = await Promise.all([
@@ -271,8 +287,8 @@ export async function fetchAccountUsage(
 
   const available =
     initialAvailable.projectId === projectId
-      ? initialAvailable.result
-      : await fetchAvailableModelsCatalog(creds.token, projectId, signal);
+      ? initialAvailable
+      : await fetchAvailableModelsSafe(creds.token, projectId, signal);
 
   const summary = summaryRes.ok ? summaryRes.result : null;
   const quotaSummaryError = summaryRes.ok ? undefined : summaryRes.error;
@@ -280,7 +296,7 @@ export async function fetchAccountUsage(
   const { groups, description } = summary
     ? parseQuotaSummary(summary.data)
     : { groups: [], description: undefined };
-  const { models, defaultAgentModelId } = parseModels(available.data);
+  const { models, defaultAgentModelId } = parseModels(available.result?.data);
 
   const assistData = (isRecord(assistResult?.data) ? assistResult.data : {}) as LoadCodeAssistRaw;
   const productTier = parseTier(assistData.currentTier);
@@ -294,7 +310,8 @@ export async function fetchAccountUsage(
 
   return {
     projectId,
-    endpoint: summary?.endpoint ?? available.endpoint ?? assistResult?.endpoint,
+    endpoint:
+      summary?.endpoint ?? available.result?.endpoint ?? assistResult?.endpoint ?? DEFAULT_ENDPOINT,
     email: creds.email,
     productTier,
     paidTier,
@@ -303,6 +320,7 @@ export async function fetchAccountUsage(
     groupDescription: description,
     quotaSummaryError,
     validationUrl,
+    modelCatalogError: available.error,
     models,
     defaultAgentModelId,
     fetchedAt: Date.now(),
@@ -470,7 +488,11 @@ export function formatModelsList(usage: AccountUsage, opts?: { all?: boolean }):
     : usage.models.filter((m) => !/tab_|chat_/i.test(m.modelId));
 
   if (!rows.length) {
-    lines.push("No models returned.");
+    lines.push(
+      usage.modelCatalogError
+        ? `Models unavailable: ${usage.modelCatalogError.slice(0, 160)}`
+        : "No models returned.",
+    );
     return lines.join("\n");
   }
 
@@ -579,6 +601,9 @@ export function buildUsageReport(usage: AccountUsage): UsageReport {
   if (usage.groupDescription) notes.push(usage.groupDescription);
   notes.push("Remaining percent reflects a shared pool, not a private per-model budget.");
   if (usage.quotaSummaryError) notes.push(quotaErrorNote(usage.quotaSummaryError));
+  if (usage.modelCatalogError) {
+    notes.push(`Model catalog unavailable: ${usage.modelCatalogError.slice(0, 160)}`);
+  }
 
   return {
     provider: PROVIDER_ID,

@@ -1,7 +1,12 @@
 import type { AuthStorage } from "@oh-my-pi/pi-ai";
 import type { ExtensionCommandContext, ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { getApiKey, loginAntigravity, refreshAntigravityToken } from "./auth/index.js";
-import { DEFAULT_ENDPOINT, endpointCandidates, parseApiKey } from "./client/index.js";
+import {
+  DEFAULT_ENDPOINT,
+  endpointCandidates,
+  isPlaceholderProjectId,
+  parseApiKey,
+} from "./client/index.js";
 import { getLastDiagnostics, runWithDiagnostics } from "./diagnostics/index.js";
 import {
   DEFAULT_IMAGE_DIR,
@@ -13,11 +18,13 @@ import {
 } from "./image/index.js";
 import {
   applyAntigravityCatalog,
+  clearAntigravityProjectCatalog,
   discoverAntigravityModels,
   getCurrentAntigravityCatalog,
   PROVIDER_ID,
   PROVIDER_NAME,
   resolvedCatalog,
+  retainAntigravityProjectCatalogs,
 } from "./models/index.js";
 import { ANTIGRAVITY_API, streamAntigravity } from "./stream/index.js";
 import {
@@ -48,6 +55,39 @@ function emitCommandOutput(
     console.error(text);
   } else {
     console.log(text);
+  }
+}
+
+type CatalogLifecycleContext = Pick<ExtensionCommandContext, "modelRegistry" | "sessionManager">;
+
+async function reconcileCatalogLifecycle(ctx: CatalogLifecycleContext): Promise<void> {
+  const authStorage: AuthStorage | undefined = ctx.modelRegistry.authStorage;
+  if (!authStorage || typeof authStorage.listOAuthAccounts !== "function") return;
+
+  const sessionId = ctx.sessionManager?.getSessionId?.();
+  const accounts = authStorage.listOAuthAccounts(PROVIDER_ID, sessionId);
+  if (!accounts.length) {
+    retainAntigravityProjectCatalogs([]);
+    return;
+  }
+
+  // Avoid deleting a dynamically resolved project when an older/partial stored
+  // credential has not persisted a trustworthy project id yet.
+  const projectIds: string[] = [];
+  for (const account of accounts) {
+    const projectId = account.projectId?.trim();
+    if (!projectId || isPlaceholderProjectId(projectId)) return;
+    projectIds.push(projectId);
+  }
+
+  const changed = retainAntigravityProjectCatalogs(projectIds);
+  if (changed && typeof ctx.modelRegistry.refreshProvider === "function") {
+    try {
+      await ctx.modelRegistry.refreshProvider(PROVIDER_ID, "online");
+    } catch {
+      // Lifecycle reconciliation is best-effort; the next ordinary discovery
+      // refresh will rebuild the host-visible picker.
+    }
   }
 }
 
@@ -118,6 +158,19 @@ export default function (pi: ExtensionAPI): void {
 
   const initialCatalog = getCurrentAntigravityCatalog();
 
+  // OMP does not currently expose a provider-auth-change/logout event to
+  // extensions. Reconcile project-scoped dynamic state at session start and
+  // before user work begins, which is the earliest reliable extension lifecycle
+  // surface after core auth mutations.
+  if (typeof pi.on === "function") {
+    pi.on("session_start", async (_event, ctx) => {
+      await reconcileCatalogLifecycle(ctx);
+    });
+    pi.on("before_agent_start", async (_event, ctx) => {
+      await reconcileCatalogLifecycle(ctx);
+    });
+  }
+
   pi.registerProvider(PROVIDER_ID, {
     // `ProviderConfig` has no `name` field — the display name OMP shows comes from
     // `oauth.name` below and from each model's `name`.
@@ -134,24 +187,27 @@ export default function (pi: ExtensionAPI): void {
     // Antigravity quota instead of only the /antigravity.usage command.
     usage: antigravityUsageProvider,
     // OMP: dynamic model discovery via /v1internal:fetchAvailableModels.
-    // Throws (instead of returning []) when unauthenticated or empty, so OMP
-    // retries in minutes rather than caching an empty catalog for 24h.
+    // Transport/auth failures throw so the host retries. A *successful* empty
+    // backend catalog is authoritative: clear that project's stale dynamic state
+    // and return the remaining static/other-account union instead of preserving
+    // a stale picker forever.
     fetchDynamicModels: async (apiKey: string | undefined) => {
       if (!apiKey) {
         throw new Error("Antigravity credentials not available yet. Run /login antigravity first.");
       }
       const discovered = await discoverAntigravityModels(apiKey);
       if (discovered.catalog.models.length === 0) {
-        throw new Error("Antigravity model discovery returned no selectable models");
+        clearAntigravityProjectCatalog(discovered.projectId);
+        return getCurrentAntigravityCatalog().models;
       }
       const next = resolvedCatalog(discovered.catalog, getCurrentAntigravityCatalog());
       // Bucket under the project discovery resolved for this account. OMP hands
       // this callback a bare access token, so the credential's own project id is
-      // not readable here — without using the discovered one the per-account
-      // routing table documented in docs/DYNAMIC_MODEL_DISCOVERY.md stays empty
-      // and every account shares one last-writer-wins routing table.
+      // not readable here. Return the rebuilt union so the host-global picker
+      // reflects every still-live project catalog rather than only the last
+      // account that refreshed.
       applyAntigravityCatalog(next, discovered.projectId);
-      return next.models;
+      return getCurrentAntigravityCatalog().models;
     },
     oauth: {
       name: PROVIDER_NAME,
@@ -403,6 +459,8 @@ export default function (pi: ExtensionAPI): void {
           if (discovered.catalog.models.length > 0) {
             const next = resolvedCatalog(discovered.catalog, getCurrentAntigravityCatalog());
             applyAntigravityCatalog(next, discovered.projectId);
+          } else {
+            clearAntigravityProjectCatalog(discovered.projectId);
           }
         }
         const catalog = getCurrentAntigravityCatalog();

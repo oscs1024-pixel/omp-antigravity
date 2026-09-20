@@ -14,11 +14,13 @@ import {
 } from "../src/diagnostics/diagnostics.js";
 import {
   applyAntigravityCatalog,
+  clearAntigravityProjectCatalog,
   getAntigravityRequestModelId,
   getCurrentAntigravityCatalog,
   getModelEnum,
   hasAntigravityRouting,
   registerModelEnum,
+  retainAntigravityProjectCatalogs,
 } from "../src/models/models.js";
 import { discoverAntigravityModels } from "../src/models/discovery.js";
 import { ThinkingEffort } from "../src/types/enums.js";
@@ -215,6 +217,59 @@ describe("dynamic catalog convergence", () => {
     maxTokens: 4096,
   });
 
+  it("clears a project's catalog and enum cache together", () => {
+    const id = "gemini-clear-project-only";
+    const projectId = "catalog-clear-project";
+    applyAntigravityCatalog(
+      {
+        models: [model(id)],
+        routing: { [id]: { off: id, defaultRequestId: id } },
+      },
+      projectId,
+    );
+    registerModelEnum(id, "ENUM_CLEAR_PROJECT", projectId);
+
+    assert.ok(getCurrentAntigravityCatalog().models.some((entry) => entry.id === id));
+    assert.equal(getModelEnum(id, projectId), "ENUM_CLEAR_PROJECT");
+
+    assert.equal(clearAntigravityProjectCatalog(projectId), true);
+    assert.equal(
+      getCurrentAntigravityCatalog().models.some((entry) => entry.id === id),
+      false,
+    );
+    assert.equal(getModelEnum(id, projectId), undefined);
+  });
+
+  it("reconciles removed projects while preserving still-stored projects", () => {
+    const removedId = "gemini-lifecycle-removed";
+    const keptId = "gemini-lifecycle-kept";
+    applyAntigravityCatalog(
+      {
+        models: [model(removedId)],
+        routing: { [removedId]: { off: removedId, defaultRequestId: removedId } },
+      },
+      "lifecycle-project-removed",
+    );
+    applyAntigravityCatalog(
+      {
+        models: [model(keptId)],
+        routing: { [keptId]: { off: keptId, defaultRequestId: keptId } },
+      },
+      "lifecycle-project-kept",
+    );
+
+    assert.equal(retainAntigravityProjectCatalogs(["lifecycle-project-kept"]), true);
+    const current = getCurrentAntigravityCatalog();
+    assert.equal(
+      current.models.some((entry) => entry.id === removedId),
+      false,
+    );
+    assert.equal(
+      current.models.some((entry) => entry.id === keptId),
+      true,
+    );
+  });
+
   it("removes dynamic-only models once no current project advertises them", () => {
     const staleId = "gemini-regression-stale-only";
     const keepId = "gemini-regression-keep-only";
@@ -392,6 +447,68 @@ describe("diagnostics per-project scoping", () => {
 
 describe("fetchAccountUsage recovery semantics", () => {
   const originalFetch = globalThis.fetch;
+
+  it("preserves aggregate quota when the model catalog is temporarily unavailable", async () => {
+    globalThis.fetch = (async (input: string | URL) => {
+      const url = String(input);
+      if (url.includes("/v1internal:loadCodeAssist")) {
+        return new Response(
+          JSON.stringify({
+            currentTier: { id: "paid-tier", name: "Paid" },
+            cloudaicompanionProject: "usage-soft-project",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (url.includes("/v1internal:retrieveUserQuotaSummary")) {
+        return new Response(
+          JSON.stringify({
+            groups: [
+              {
+                displayName: "Gemini models",
+                buckets: [
+                  {
+                    bucketId: "weekly",
+                    displayName: "Weekly",
+                    remainingFraction: 0.42,
+                  },
+                ],
+              },
+            ],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (url.includes("/v1internal:fetchAvailableModels")) {
+        return new Response(JSON.stringify({ error: { message: "catalog temporarily down" } }), {
+          status: 503,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    }) as typeof fetch;
+
+    try {
+      const usage = await fetchAccountUsage(
+        JSON.stringify({
+          token: "usage-soft-catalog-token",
+          projectId: "",
+          email: "soft@example.com",
+        }),
+      );
+      assert.equal(usage.projectId, "usage-soft-project");
+      assert.equal(usage.models.length, 0);
+      assert.match(usage.modelCatalogError ?? "", /catalog temporarily down/);
+      assert.equal(usage.groups[0]?.buckets[0]?.remainingFraction, 0.42);
+
+      const report = buildUsageReport(usage);
+      assert.equal(report.limits.length, 1);
+      assert.equal(report.limits[0]?.amount.remainingFraction, 0.42);
+      assert.ok(report.notes?.some((note) => note.includes("Model catalog unavailable")));
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 
   it("uses real project and preserves unknown quota/account scope", async () => {
     const projects: string[] = [];
@@ -609,6 +726,188 @@ describe("formatAccountQuotaSummary", () => {
 });
 
 describe("extension registration", () => {
+  it("converges an authoritative empty dynamic catalog instead of preserving stale models", async () => {
+    const staleId = "gemini-empty-catalog-stale";
+    const projectId = "empty-catalog-project";
+    applyAntigravityCatalog(
+      {
+        models: [
+          {
+            id: staleId,
+            name: staleId,
+            reasoning: true,
+            input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 100000,
+            maxTokens: 4096,
+          },
+        ],
+        routing: { [staleId]: { off: staleId, defaultRequestId: staleId } },
+      },
+      projectId,
+    );
+
+    let providerConfig:
+      | { fetchDynamicModels?: (apiKey: string | undefined) => Promise<Array<{ id: string }>> }
+      | undefined;
+    const dummyNode: Record<string, unknown> = {};
+    dummyNode.describe = () => dummyNode;
+    dummyNode.optional = () => dummyNode;
+    const mockPi = {
+      setLabel: () => {},
+      on: () => {},
+      zod: {
+        object: () => dummyNode,
+        string: () => dummyNode,
+        enum: () => dummyNode,
+      },
+      registerProvider: (_name: string, config: unknown) => {
+        providerConfig = config as typeof providerConfig;
+      },
+      registerCommand: () => {},
+      registerTool: () => {},
+    } as unknown as ExtensionAPI;
+
+    const previousPrewarm = process.env.ANTIGRAVITY_NO_PREWARM;
+    process.env.ANTIGRAVITY_NO_PREWARM = "1";
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: string | URL) => {
+      const url = String(input);
+      if (url.includes("/v1internal:loadCodeAssist")) {
+        return new Response(
+          JSON.stringify({
+            currentTier: { id: "free-tier" },
+            cloudaicompanionProject: projectId,
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (url.includes("/v1internal:fetchAvailableModels")) {
+        return new Response(JSON.stringify({ models: {} }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    }) as typeof fetch;
+
+    try {
+      registerExtension(mockPi);
+      assert.ok(providerConfig?.fetchDynamicModels);
+      const models = await providerConfig.fetchDynamicModels("empty-catalog-token");
+      assert.equal(
+        models.some((entry) => entry.id === staleId),
+        false,
+      );
+      assert.equal(
+        getCurrentAntigravityCatalog().models.some((entry) => entry.id === staleId),
+        false,
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (previousPrewarm === undefined) delete process.env.ANTIGRAVITY_NO_PREWARM;
+      else process.env.ANTIGRAVITY_NO_PREWARM = previousPrewarm;
+    }
+  });
+
+  it("reconciles removed account catalogs on the next prompt lifecycle event", async () => {
+    const removedId = "gemini-hook-removed";
+    const keptId = "gemini-hook-kept";
+    applyAntigravityCatalog(
+      {
+        models: [
+          {
+            id: removedId,
+            name: removedId,
+            reasoning: true,
+            input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 100000,
+            maxTokens: 4096,
+          },
+        ],
+        routing: { [removedId]: { off: removedId, defaultRequestId: removedId } },
+      },
+      "hook-project-removed",
+    );
+    applyAntigravityCatalog(
+      {
+        models: [
+          {
+            id: keptId,
+            name: keptId,
+            reasoning: true,
+            input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 100000,
+            maxTokens: 4096,
+          },
+        ],
+        routing: { [keptId]: { off: keptId, defaultRequestId: keptId } },
+      },
+      "hook-project-kept",
+    );
+
+    const handlers: Record<string, (event: unknown, ctx: unknown) => Promise<void> | void> = {};
+    const dummyNode: Record<string, unknown> = {};
+    dummyNode.describe = () => dummyNode;
+    dummyNode.optional = () => dummyNode;
+    const mockPi = {
+      setLabel: () => {},
+      on: (event: string, handler: (event: unknown, ctx: unknown) => Promise<void> | void) => {
+        handlers[event] = handler;
+      },
+      zod: {
+        object: () => dummyNode,
+        string: () => dummyNode,
+        enum: () => dummyNode,
+      },
+      registerProvider: () => {},
+      registerCommand: () => {},
+      registerTool: () => {},
+    } as unknown as ExtensionAPI;
+
+    const previousPrewarm = process.env.ANTIGRAVITY_NO_PREWARM;
+    process.env.ANTIGRAVITY_NO_PREWARM = "1";
+    try {
+      registerExtension(mockPi);
+      assert.ok(handlers.before_agent_start);
+      await handlers.before_agent_start(
+        {},
+        {
+          sessionManager: { getSessionId: () => "lifecycle-session" },
+          modelRegistry: {
+            authStorage: {
+              listOAuthAccounts: () => [
+                {
+                  position: 0,
+                  credentialId: 1,
+                  email: "kept@example.com",
+                  projectId: "hook-project-kept",
+                  active: true,
+                },
+              ],
+            },
+            refreshProvider: async () => {},
+          },
+        },
+      );
+
+      const current = getCurrentAntigravityCatalog();
+      assert.equal(
+        current.models.some((entry) => entry.id === removedId),
+        false,
+      );
+      assert.equal(
+        current.models.some((entry) => entry.id === keptId),
+        true,
+      );
+    } finally {
+      if (previousPrewarm === undefined) delete process.env.ANTIGRAVITY_NO_PREWARM;
+      else process.env.ANTIGRAVITY_NO_PREWARM = previousPrewarm;
+    }
+  });
+
   it("does not fail registration when ANTIGRAVITY_BASE_URL is invalid", () => {
     const previous = process.env.ANTIGRAVITY_BASE_URL;
     process.env.ANTIGRAVITY_BASE_URL = "http://untrusted.example.test";
