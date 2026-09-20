@@ -15,9 +15,9 @@ bun install
 bun run check
 ```
 
-This repo uses [Bun](https://bun.sh). `bun run check` runs TypeScript, ESLint, Prettier, the repository security checks, and the test scripts. Run it before opening a pull request.
+This repo uses [Bun](https://bun.sh). `bun run check` runs TypeScript, ESLint, the complete Bun unit/regression suite, and Prettier verification. Run it before opening a pull request.
 
-The test scripts run on a plain Bun host rather than inside OMP, so they resolve OMP-only host symbols (such as the legacy `calculateCost` shim) defensively and skip those assertions when the symbol is absent. Prefer that pattern over importing an OMP-only symbol by name: a named import of a shim-only export fails the whole module outside OMP.
+The test suite runs on a plain Bun host rather than inside OMP, so tests and runtime modules resolve OMP-only host symbols (such as the legacy `calculateCost` shim) defensively. Prefer that pattern over importing an OMP-only symbol by name: a named import of a shim-only export fails the whole module outside OMP.
 
 ## Pull requests
 

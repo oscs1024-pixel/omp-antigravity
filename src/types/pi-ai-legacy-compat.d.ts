@@ -29,7 +29,7 @@
  *
  * A named import (`import { calculateCost } from "@oh-my-pi/pi-ai"`) links the
  * symbol at module load time. Outside OMP the real barrel does not export it, so
- * the whole module fails to load — this is why the test scripts run through Bun
+ * the whole module fails to load — this is why the test suite runs through Bun
  * and not OMP at all. Read shim-only symbols off the module namespace instead and
  * handle their absence, as `src/stream/stream.ts` does for `calculateCost`.
  * The shim itself re-exports them with `export { ... }`

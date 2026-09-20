@@ -14,6 +14,7 @@ import {
   extractProjectId,
   fetchAvailableModelsCatalog,
   fetchCodeAssistMetadata,
+  isPlaceholderProjectId,
   parseApiKey,
   postAntigravityJson,
   resolveProjectId,
@@ -97,7 +98,7 @@ function parseQuotaSummary(data: unknown): { groups: QuotaGroup[]; description?:
         window: bucket.window ? String(bucket.window) : undefined,
         resetTime: bucket.resetTime ? String(bucket.resetTime) : undefined,
         description: bucket.description ? String(bucket.description) : undefined,
-        remainingFraction: remaining ?? 0,
+        ...(remaining !== undefined ? { remainingFraction: remaining } : {}),
       });
     }
     if (!buckets.length && !group.displayName) continue;
@@ -227,27 +228,51 @@ export async function fetchAccountUsage(
   const signal = options?.signal;
   const creds = parseApiKey(apiKeyRaw);
   setLastAccountId(creds.email);
-  const initialProjectId =
-    creds.projectId ||
-    resolveProjectId({
-      credentialProjectId: creds.projectId,
-    });
 
-  // Fetch loadCodeAssist, quota summary, and available models all in parallel
-  // to minimize command execution latency.
-  const [assistResult, summaryRes, available] = await Promise.all([
-    loadCodeAssistSafe(creds.token, signal),
-    fetchQuotaSummarySafe(creds.token, signal),
-    fetchAvailableModelsCatalog(creds.token, initialProjectId, signal),
+  const credentialProjectId =
+    creds.projectId && !isPlaceholderProjectId(creds.projectId) ? creds.projectId : undefined;
+
+  // Tier/quota calls are project-independent. Model discovery is not: when the
+  // credential has no authoritative project, wait for loadCodeAssist before
+  // querying the catalog so we never send a synthetic placeholder project.
+  const assistPromise = loadCodeAssistSafe(creds.token, signal);
+  const summaryPromise = fetchQuotaSummarySafe(creds.token, signal);
+  const availablePromise = (async () => {
+    if (credentialProjectId) {
+      return {
+        projectId: credentialProjectId,
+        result: await fetchAvailableModelsCatalog(creds.token, credentialProjectId, signal),
+      };
+    }
+    const assist = await assistPromise;
+    const discoveredProject = assist ? extractProjectId(assist.data) : undefined;
+    const projectId = resolveProjectId({
+      warmedProject: discoveredProject ?? null,
+      credentialProjectId,
+    });
+    return {
+      projectId,
+      result: await fetchAvailableModelsCatalog(creds.token, projectId, signal),
+    };
+  })();
+
+  const [assistResult, summaryRes, initialAvailable] = await Promise.all([
+    assistPromise,
+    summaryPromise,
+    availablePromise,
   ]);
 
-  // Derive project ID from the loadCodeAssist response or stored project ID.
   const discoveredProject = assistResult ? extractProjectId(assistResult.data) : undefined;
   const projectId = resolveProjectId({
     warmedProject: discoveredProject ?? null,
-    credentialProjectId: creds.projectId,
+    credentialProjectId,
   });
   setLastProjectId(projectId);
+
+  const available =
+    initialAvailable.projectId === projectId
+      ? initialAvailable.result
+      : await fetchAvailableModelsCatalog(creds.token, projectId, signal);
 
   const summary = summaryRes.ok ? summaryRes.result : null;
   const quotaSummaryError = summaryRes.ok ? undefined : summaryRes.error;
@@ -261,8 +286,6 @@ export async function fetchAccountUsage(
   const productTier = parseTier(assistData.currentTier);
   const paidTier = parseTier(assistData.paidTier);
 
-  // Google returns currentTier=free-tier even for Google AI Pro accounts.
-  // The real subscription lives in paidTier (e.g. g1-pro-tier / Google AI Pro).
   const planLabel = paidTier?.name
     ? `${paidTier.name}${paidTier.id ? ` (${paidTier.id})` : ""}`
     : productTier?.name
@@ -272,6 +295,7 @@ export async function fetchAccountUsage(
   return {
     projectId,
     endpoint: summary?.endpoint ?? available.endpoint ?? assistResult?.endpoint,
+    email: creds.email,
     productTier,
     paidTier,
     planLabel,
@@ -322,7 +346,10 @@ export function formatUsageSummary(
     for (const bucket of group.buckets) {
       const rem = remainingPercent(bucket.remainingFraction);
       const remText = rem !== undefined ? `${rem}%` : "?";
-      const remColored = useColor ? formatHealthColor(bucket.remainingFraction, remText) : remText;
+      const remColored =
+        useColor && bucket.remainingFraction !== undefined
+          ? formatHealthColor(bucket.remainingFraction, remText)
+          : remText;
       const bar = progressBar(bucket.remainingFraction, 20, useColor);
       const resetText = bucket.resetTime
         ? useColor
@@ -377,10 +404,14 @@ export function formatAccountQuotaSummary(
     const labelWidth = Math.max(...buckets.map(({ label }) => label.length));
 
     for (const { bucket, label } of buckets) {
-      const rawPercent = `${Math.round(bucket.remainingFraction * 100)}%`.padStart(4);
-      const percentStr = useColor
-        ? `${formatHealthColor(bucket.remainingFraction, rawPercent)} left`
-        : `${rawPercent} left`;
+      const rawPercent =
+        bucket.remainingFraction === undefined
+          ? "?".padStart(4)
+          : `${Math.round(bucket.remainingFraction * 100)}%`.padStart(4);
+      const percentStr =
+        useColor && bucket.remainingFraction !== undefined
+          ? `${formatHealthColor(bucket.remainingFraction, rawPercent)} left`
+          : `${rawPercent} left`;
       const reset = bucket.resetTime
         ? useColor
           ? `  \x1b[90mresets in\x1b[0m ${formatReset(bucket.resetTime)}`
@@ -515,7 +546,9 @@ export function buildUsageReport(usage: AccountUsage): UsageReport {
       const hasResetsAt = Number.isFinite(resetsAt);
       const amount: UsageAmount = {
         unit: "percent",
-        remainingFraction: bucket.remainingFraction,
+        ...(bucket.remainingFraction !== undefined
+          ? { remainingFraction: bucket.remainingFraction }
+          : {}),
       };
       limits.push({
         id: `${PROVIDER_ID}:${group.displayName}:${bucket.bucketId}`,

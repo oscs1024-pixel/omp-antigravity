@@ -200,7 +200,7 @@ export type QuotaBucket = {
   window?: string;
   resetTime?: string;
   description?: string;
-  remainingFraction: number;
+  remainingFraction?: number;
 };
 
 export type QuotaGroup = {

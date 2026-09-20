@@ -56,16 +56,26 @@ export function stableProjectId(seed: string): string {
  * split one account across two per-project routing buckets.
  */
 const FALLBACK_PROJECT_SEED = "antigravity-default";
+const FALLBACK_PROJECT_ID = stableProjectId(FALLBACK_PROJECT_SEED);
+
+/**
+ * Whether a project id is the synthetic fallback rather than a project resolved
+ * from Google. Treat it as missing on later requests so a transient discovery
+ * failure can heal automatically instead of poisoning the credential forever.
+ */
+export function isPlaceholderProjectId(projectId: string | undefined): boolean {
+  return projectId?.trim() === FALLBACK_PROJECT_ID;
+}
 
 /**
  * Fallback project id when discovery fails.
  * Prefer ANTIGRAVITY_PROJECT_ID, then the shared stable placeholder.
  */
 export function defaultProjectId(): string {
-  return antigravityEnv("PROJECT_ID")?.trim() || stableProjectId(FALLBACK_PROJECT_SEED);
+  return antigravityEnv("PROJECT_ID")?.trim() || FALLBACK_PROJECT_ID;
 }
 
-/** @deprecated Use defaultProjectId(); kept for scripts that imported the old constant. */
+/** @deprecated Use defaultProjectId(); kept for backwards compatibility. */
 export const DEFAULT_PROJECT_ID = defaultProjectId();
 
 export function endpointCandidates(): string[] {

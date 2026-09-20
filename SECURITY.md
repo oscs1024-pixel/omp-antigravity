@@ -8,7 +8,7 @@ Security fixes are applied to the latest published release. Please upgrade to th
 
 Please **do not** open a public issue for a suspected vulnerability.
 
-Use [GitHub private vulnerability reporting](https://github.com/Rahularya01/pi-antigravity/security/advisories/new) to send a report directly to the maintainers. Include:
+Use [GitHub private vulnerability reporting](https://github.com/oscs1024-pixel/omp-antigravity/security/advisories/new) to send a report directly to the maintainers. Include:
 
 - a clear description and impact assessment;
 - reproducible steps or a minimal proof of concept;

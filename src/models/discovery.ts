@@ -1,6 +1,7 @@
 import {
   defaultProjectId,
   fetchAvailableModelsCatalog,
+  isPlaceholderProjectId,
   loadCodeAssist,
   parseApiKey,
 } from "../client/index.js";
@@ -39,8 +40,10 @@ export async function discoverAntigravityModels(
   signal?: AbortSignal,
 ): Promise<AntigravityDiscovery> {
   const creds = parseApiKey(apiKey);
+  const credentialProjectId =
+    creds.projectId && !isPlaceholderProjectId(creds.projectId) ? creds.projectId : undefined;
   const projectId =
-    creds.projectId || (await loadCodeAssist(creds.token, signal)) || defaultProjectId();
+    credentialProjectId || (await loadCodeAssist(creds.token, signal)) || defaultProjectId();
   const available = await fetchAvailableModelsCatalog(creds.token, projectId, signal);
   const models = available.data.models;
   if (!models || Object.keys(models).length === 0) {
