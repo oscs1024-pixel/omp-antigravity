@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { loginAntigravity, REDIRECT_URI, TOKEN_URL } from "../src/auth/oauth.js";
+import {
+  loginAntigravity,
+  REDIRECT_URI,
+  refreshAntigravityToken,
+  TOKEN_URL,
+} from "../src/auth/oauth.js";
+import { defaultProjectId } from "../src/client/client.js";
 
 describe("OAuth callback server", () => {
   const originalFetch = globalThis.fetch;
@@ -68,6 +74,58 @@ describe("OAuth callback server", () => {
     } finally {
       abort.abort();
       globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+describe("OAuth placeholder project recovery", () => {
+  const originalFetch = globalThis.fetch;
+
+  it("re-discovers a real project on refresh instead of trusting the placeholder", async () => {
+    const previousProject = process.env.ANTIGRAVITY_PROJECT_ID;
+    delete process.env.ANTIGRAVITY_PROJECT_ID;
+    let discoveryCalls = 0;
+
+    globalThis.fetch = (async (input: string | URL) => {
+      const url = String(input);
+      if (url === TOKEN_URL) {
+        return new Response(JSON.stringify({ access_token: "refreshed-token", expires_in: 3600 }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (url.includes("/v1internal:loadCodeAssist")) {
+        discoveryCalls++;
+        return new Response(
+          JSON.stringify({
+            currentTier: { id: "free-tier" },
+            cloudaicompanionProject: "recovered-real-project",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    }) as typeof fetch;
+
+    try {
+      const refreshed = await refreshAntigravityToken({
+        type: "oauth",
+        refresh: "refresh-token",
+        access: "old-access",
+        expires: 0,
+        projectId: defaultProjectId(),
+        email: "recover@example.com",
+      } as Parameters<typeof refreshAntigravityToken>[0]);
+
+      assert.equal(discoveryCalls, 1);
+      assert.equal(
+        (refreshed as typeof refreshed & { projectId?: string }).projectId,
+        "recovered-real-project",
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (previousProject === undefined) delete process.env.ANTIGRAVITY_PROJECT_ID;
+      else process.env.ANTIGRAVITY_PROJECT_ID = previousProject;
     }
   });
 });

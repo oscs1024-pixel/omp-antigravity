@@ -274,6 +274,7 @@ let currentRouting: Record<string, AntigravityRouting> = { ...ANTIGRAVITY_ROUTIN
 const MAX_PROJECT_CATALOGS = 64;
 const MAX_MODEL_ENUMS = 64;
 const catalogsByProject = new Map<string, AntigravityCatalog>();
+let unscopedCatalog: AntigravityCatalog | undefined;
 
 export function getCurrentAntigravityCatalog(): AntigravityCatalog {
   return { models: currentModels, routing: currentRouting };
@@ -298,15 +299,30 @@ export function hasAntigravityRouting(modelId: string, projectId?: string): bool
   return routingFor(modelId, projectId) !== undefined;
 }
 
+function rebuildCurrentCatalog(): void {
+  const models = new Map<string, ProviderModelConfig>();
+  for (const model of ANTIGRAVITY_MODELS) models.set(model.id, model);
+  const routing: Record<string, AntigravityRouting> = { ...ANTIGRAVITY_ROUTING };
+
+  const merge = (catalog: AntigravityCatalog): void => {
+    for (const model of catalog.models) models.set(model.id, model);
+    Object.assign(routing, catalog.routing);
+  };
+
+  if (unscopedCatalog) merge(unscopedCatalog);
+  for (const catalog of catalogsByProject.values()) merge(catalog);
+
+  currentModels = Array.from(models.values());
+  currentRouting = routing;
+}
+
 export function applyAntigravityCatalog(catalog: AntigravityCatalog, projectId?: string): void {
   if (projectId) {
     setWithCap(catalogsByProject, projectId, catalog, MAX_PROJECT_CATALOGS);
+  } else {
+    unscopedCatalog = catalog;
   }
-  const existingMap = new Map<string, ProviderModelConfig>();
-  for (const m of currentModels) existingMap.set(m.id, m);
-  for (const m of catalog.models) existingMap.set(m.id, m);
-  currentModels = Array.from(existingMap.values());
-  currentRouting = { ...currentRouting, ...catalog.routing };
+  rebuildCurrentCatalog();
 }
 
 /** Resolve public model id + thinking effort to Antigravity runtime model id. */

@@ -15,6 +15,7 @@ import {
 import {
   applyAntigravityCatalog,
   getAntigravityRequestModelId,
+  getCurrentAntigravityCatalog,
   getModelEnum,
   hasAntigravityRouting,
   registerModelEnum,
@@ -22,7 +23,11 @@ import {
 import { discoverAntigravityModels } from "../src/models/discovery.js";
 import { ThinkingEffort } from "../src/types/enums.js";
 import type { AccountUsage } from "../src/types/types.js";
-import { formatAccountQuotaSummary } from "../src/usage/usage.js";
+import {
+  buildUsageReport,
+  fetchAccountUsage,
+  formatAccountQuotaSummary,
+} from "../src/usage/usage.js";
 import {
   clearSessionTrajectoryMap,
   recordSessionExecutionId,
@@ -199,6 +204,51 @@ describe("applyAntigravityCatalog per-project routing", () => {
   });
 });
 
+describe("dynamic catalog convergence", () => {
+  const model = (id: string) => ({
+    id,
+    name: id,
+    reasoning: true,
+    input: ["text" as const],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 100000,
+    maxTokens: 4096,
+  });
+
+  it("removes dynamic-only models once no current project advertises them", () => {
+    const staleId = "gemini-regression-stale-only";
+    const keepId = "gemini-regression-keep-only";
+    applyAntigravityCatalog(
+      {
+        models: [model(staleId)],
+        routing: { [staleId]: { off: staleId, defaultRequestId: staleId } },
+      },
+      "catalog-convergence-A",
+    );
+    applyAntigravityCatalog(
+      {
+        models: [model(keepId)],
+        routing: { [keepId]: { off: keepId, defaultRequestId: keepId } },
+      },
+      "catalog-convergence-B",
+    );
+    assert.ok(getCurrentAntigravityCatalog().models.some((entry) => entry.id === staleId));
+    assert.ok(getCurrentAntigravityCatalog().models.some((entry) => entry.id === keepId));
+
+    applyAntigravityCatalog({ models: [], routing: {} }, "catalog-convergence-A");
+
+    const current = getCurrentAntigravityCatalog();
+    assert.equal(
+      current.models.some((entry) => entry.id === staleId),
+      false,
+    );
+    assert.equal(
+      current.models.some((entry) => entry.id === keepId),
+      true,
+    );
+  });
+});
+
 describe("hasAntigravityRouting account scope", () => {
   it("uses only the account catalog and static fallback for scoped routing", () => {
     applyAntigravityCatalog(
@@ -337,6 +387,70 @@ describe("diagnostics per-project scoping", () => {
     assert.equal(getLastDiagnostics("first@example.com").status, 200);
     assert.equal(getLastDiagnostics("second@example.com").status, 403);
     assert.deepEqual(getLastDiagnostics("missing@example.com"), {});
+  });
+});
+
+describe("fetchAccountUsage recovery semantics", () => {
+  const originalFetch = globalThis.fetch;
+
+  it("uses real project and preserves unknown quota/account scope", async () => {
+    const projects: string[] = [];
+    globalThis.fetch = (async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/v1internal:loadCodeAssist")) {
+        return new Response(
+          JSON.stringify({
+            currentTier: { id: "free-tier", name: "Free Tier" },
+            cloudaicompanionProject: "usage-real-project",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (url.includes("/v1internal:retrieveUserQuotaSummary")) {
+        return new Response(
+          JSON.stringify({
+            groups: [
+              {
+                displayName: "Gemini models",
+                buckets: [{ bucketId: "weekly", displayName: "Weekly" }],
+              },
+            ],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (url.includes("/v1internal:fetchAvailableModels")) {
+        const body = JSON.parse(String(init?.body ?? "{}")) as { project?: string };
+        if (body.project) projects.push(body.project);
+        return new Response(JSON.stringify({ models: {} }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    }) as typeof fetch;
+
+    try {
+      const usage = await fetchAccountUsage(
+        JSON.stringify({
+          token: "usage-recovery-token",
+          projectId: "",
+          email: "usage@example.com",
+        }),
+      );
+      assert.equal(usage.projectId, "usage-real-project");
+      assert.equal(usage.email, "usage@example.com");
+      assert.ok(projects.length > 0);
+      assert.ok(projects.every((project) => project === "usage-real-project"));
+      assert.equal(usage.groups[0]?.buckets[0]?.remainingFraction, undefined);
+
+      const report = buildUsageReport(usage);
+      assert.equal(report.limits[0]?.status, "unknown");
+      assert.equal(report.limits[0]?.amount.remainingFraction, undefined);
+      assert.equal(report.limits[0]?.scope.accountId, "usage@example.com");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });
 

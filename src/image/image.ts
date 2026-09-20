@@ -1,11 +1,12 @@
-import { mkdir, realpath } from "node:fs/promises";
-import { dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { lstat, mkdir, realpath } from "node:fs/promises";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   AntigravityHttpError,
   antigravityHeaders,
   defaultProjectId,
   endpointCandidates,
   isRetryableEndpointStatus,
+  isPlaceholderProjectId,
   jsonOrTextError,
   loadCodeAssist,
   parseApiKey,
@@ -258,9 +259,13 @@ export async function collectImagesFromSse(
     while (true) {
       if (signal?.aborted) throw new Error("Request was aborted");
       const result = await reader.read();
-      if (result.done) break;
-      if (!(result.value instanceof Uint8Array)) continue;
-      buffer += decoder.decode(result.value, { stream: true });
+      if (result.done) {
+        buffer += decoder.decode();
+        if (buffer && !buffer.endsWith("\n")) buffer += "\n";
+      } else {
+        if (!(result.value instanceof Uint8Array)) continue;
+        buffer += decoder.decode(result.value, { stream: true });
+      }
       // Incremental scan (same pattern as streamResponse): slice consumed lines
       // off once per network chunk instead of re-splitting the whole buffer,
       // which matters here because base64 image payloads are large.
@@ -289,6 +294,7 @@ export async function collectImagesFromSse(
         buffer = buffer.slice(scanStart);
         scanStart = 0;
       }
+      if (result.done) break;
     }
   } finally {
     reader.releaseLock();
@@ -296,19 +302,78 @@ export async function collectImagesFromSse(
   return { images, text };
 }
 
-async function writeImage(cwd: string, filePath: string, image: GeneratedImage): Promise<string> {
-  const root = await realpath(resolve(cwd));
-  await mkdir(dirname(filePath), { recursive: true });
-  // After mkdir, resolve the real path to defend against symlink traversal:
-  // a symlink in any ancestor directory could redirect writes outside cwd.
-  const realDir = await realpath(dirname(filePath));
-  const realTarget = join(realDir, filePath.slice(dirname(filePath).length + 1));
-  const rel = relative(root, realTarget);
-  if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
-    throw new Error("Image save path escapes the working directory (symlink traversal).");
+function fsErrorCode(error: unknown): string | undefined {
+  return error && typeof error === "object" && "code" in error
+    ? String((error as NodeJS.ErrnoException).code)
+    : undefined;
+}
+
+async function imageDirectorySegments(
+  cwd: string,
+  filePath: string,
+): Promise<{ root: string; segments: string[] }> {
+  const lexicalRoot = resolve(cwd);
+  const targetDir = dirname(filePath);
+  const relDir = relative(lexicalRoot, targetDir);
+  if (relDir === ".." || relDir.startsWith(`..${sep}`) || isAbsolute(relDir)) {
+    throw new Error("Image save path must be inside the working directory.");
   }
-  // Open the already-resolved final path without following a link swapped into
-  // place between validation and write.
+  const root = await realpath(lexicalRoot);
+  return { root, segments: relDir ? relDir.split(sep).filter(Boolean) : [] };
+}
+
+async function assertSafeImageSaveDestination(cwd: string, filePath: string): Promise<void> {
+  const { root, segments } = await imageDirectorySegments(cwd, filePath);
+  let current = root;
+  for (const segment of segments) {
+    const next = join(current, segment);
+    try {
+      const info = await lstat(next);
+      if (info.isSymbolicLink()) {
+        throw new Error("Image save path escapes the working directory (symlink traversal).");
+      }
+      if (!info.isDirectory()) {
+        throw new Error("Image save path contains a non-directory ancestor.");
+      }
+      current = next;
+    } catch (error) {
+      if (fsErrorCode(error) === "ENOENT") return;
+      throw error;
+    }
+  }
+}
+
+async function ensureSafeImageDirectory(cwd: string, filePath: string): Promise<string> {
+  const { root, segments } = await imageDirectorySegments(cwd, filePath);
+  let current = root;
+  for (const segment of segments) {
+    const next = join(current, segment);
+    let info;
+    try {
+      info = await lstat(next);
+    } catch (error) {
+      if (fsErrorCode(error) !== "ENOENT") throw error;
+      try {
+        await mkdir(next, { mode: 0o700 });
+      } catch (mkdirError) {
+        if (fsErrorCode(mkdirError) !== "EEXIST") throw mkdirError;
+      }
+      info = await lstat(next);
+    }
+    if (info.isSymbolicLink()) {
+      throw new Error("Image save path escapes the working directory (symlink traversal).");
+    }
+    if (!info.isDirectory()) {
+      throw new Error("Image save path contains a non-directory ancestor.");
+    }
+    current = next;
+  }
+  return current;
+}
+
+async function writeImage(cwd: string, filePath: string, image: GeneratedImage): Promise<string> {
+  const realDir = await ensureSafeImageDirectory(cwd, filePath);
+  const realTarget = join(realDir, basename(filePath));
   await writePrivateFileNoFollow(realTarget, Buffer.from(image.data, "base64"));
   return filePath;
 }
@@ -324,13 +389,17 @@ export async function generateAntigravityImage(
   const aspectRatio = assertSafeAspectRatio(options.aspectRatio || "1:1");
   const preferred = assertSafeImageModel(options.model || DEFAULT_IMAGE_MODEL);
   // Path containment is independent of the generated MIME type. Reject invalid
-  // user input before spending any image-generation quota.
-  resolveImageSavePath(options.cwd, options.path);
+  // user input and existing symlink ancestors before spending generation quota.
+  const preflightPath = resolveImageSavePath(options.cwd, options.path);
+  await assertSafeImageSaveDestination(options.cwd, preflightPath);
   const models = [preferred, ...IMAGE_MODEL_FALLBACKS.filter((id) => id !== preferred)];
   const creds = parseApiKey(options.apiKey);
-  // Bare-token credentials (OMP peekApiKey form) carry no project id —
-  // discover it the same way the streaming path does.
-  const projectId = creds.projectId || (await loadCodeAssist(creds.token)) || defaultProjectId();
+  // Bare-token or legacy placeholder credentials carry no authoritative
+  // project id — discover it the same way the streaming path does.
+  const credentialProjectId =
+    creds.projectId && !isPlaceholderProjectId(creds.projectId) ? creds.projectId : undefined;
+  const projectId =
+    credentialProjectId || (await loadCodeAssist(creds.token)) || defaultProjectId();
   const headers = antigravityHeaders(creds.token);
   const endpoints = endpointCandidates();
 

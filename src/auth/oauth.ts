@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@oh-my-pi/pi-ai";
-import { defaultProjectId, loadCodeAssist } from "../client/client.js";
+import { isPlaceholderProjectId, loadCodeAssist } from "../client/client.js";
 import { antigravityFetch, withDeadline } from "../utils/http.js";
 import { escapeHtml, antigravityEnv } from "../utils/util.js";
 import { resolveCallbackHost, redactSecrets } from "../utils/security.js";
@@ -416,7 +416,7 @@ export async function loginAntigravity(
       refresh: tokenData.refresh_token,
       access: tokenData.access_token,
       expires: Date.now() + tokenData.expires_in * 1000 - 5 * 60 * 1000,
-      projectId: discoveredProject || defaultProjectId(),
+      ...(discoveredProject ? { projectId: discoveredProject } : {}),
       email,
     };
   } finally {
@@ -452,22 +452,25 @@ export async function refreshAntigravityToken(
   // can never hit here — skip the extra round-trip entirely when we already know the
   // project id (the normal case; it's set at login and doesn't change token to token).
   const existingProjectId = credentialProjectId(credentials);
-  const discoveredProject = existingProjectId ? undefined : await loadCodeAssist(data.access_token);
+  const trustedProjectId =
+    existingProjectId && !isPlaceholderProjectId(existingProjectId) ? existingProjectId : undefined;
+  const discoveredProject = trustedProjectId ? undefined : await loadCodeAssist(data.access_token);
   const email = credentialEmail(credentials) || deriveFallbackEmail(credentials.refresh);
   return {
     ...credentials,
     refresh: data.refresh_token || credentials.refresh,
     access: data.access_token,
     expires: Date.now() + data.expires_in * 1000 - 5 * 60 * 1000,
-    projectId: existingProjectId || discoveredProject || defaultProjectId(),
+    projectId: trustedProjectId || discoveredProject,
     email,
   };
 }
 
 export function getApiKey(credentials: OAuthCredentials): string {
+  const projectId = credentialProjectId(credentials);
   return JSON.stringify({
     token: credentials.access,
-    projectId: credentialProjectId(credentials) || defaultProjectId(),
+    projectId: projectId && !isPlaceholderProjectId(projectId) ? projectId : "",
     email: credentialEmail(credentials),
   });
 }

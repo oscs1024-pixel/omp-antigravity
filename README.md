@@ -390,7 +390,7 @@ omp plugin install omp-antigravity
 ### 2. 从 GitHub 仓库安装
 
 ```bash
-omp plugin install github:Rahularya01/omp-antigravity
+omp plugin install github:oscs1024-pixel/omp-antigravity
 ```
 
 ### 3. 本地开发软链
@@ -550,31 +550,23 @@ Antigravity 平台提供跨厂商的多模型支持。插件将各模型折叠�
 
 ## 本地开发与测试
 
-本仓库采用 TypeScript 开发，针对 OMP 18.x 插件运行规范严格对齐：
+本仓库采用 TypeScript + Bun 开发，针对 OMP 18.x 插件运行规范严格对齐：
 
 ```bash
-# 1. 安装依赖
-npm install
+# 安装锁定依赖
+bun install --frozen-lockfile
 
-# 2. 静态代码质量检查 (TypeScript 严格类型检查)
-npm run typecheck
+# 分项检查
+bun run typecheck
+bun run lint
+bun run test
+bun run format:check
 
-# 3. 语法与代码风格检查
-npm run lint
-
-# 4. 代码格式化检查
-npm run format:check
-
-# 5. 安全断言检查 (防止 API 密钥泄露与敏感配置)
-npm run security-check
-
-# 6. 一键全项检查
-npm run check
+# 一键执行全部离线门禁
+bun run check
 ```
 
-`npm run check` 覆盖类型检查、Lint、单元测试（`test/`）与确定性脚本断言（`scripts/` 下 8 个离线脚本，含 SSE 解析、流看门狗、用量格式化、模型折叠、安全断言）。
-
-需要真实凭据或联网的实时烟测脚本不在门禁内，需手动执行：`scripts/smoke-tool-schema.ts`、`scripts/smoke-all-models.mjs`、`scripts/omp-credentials.mjs`、`scripts/load-check.mjs`。
+`bun run check` 是唯一的离线 CI 门禁，覆盖 TypeScript 严格类型检查、ESLint、`test/` 下完整单元/回归测试以及 Prettier 格式校验。仓库不依赖未提交的本地 `scripts/` 文件；新增行为回归应进入 `test/`，保证 checkout 后即可复现。
 
 ---
 

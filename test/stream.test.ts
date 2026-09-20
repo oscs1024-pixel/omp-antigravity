@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { setImmediate as immediate } from "node:timers/promises";
 import type { Api, AssistantMessageEventStream, Context, Model } from "@oh-my-pi/pi-ai";
-import { endpointCandidates, resetEndpointPreferenceForTests } from "../src/client/client.js";
+import {
+  defaultProjectId,
+  endpointCandidates,
+  resetEndpointPreferenceForTests,
+} from "../src/client/client.js";
 import { streamAntigravity } from "../src/stream/stream.js";
 
 const model = {
@@ -65,6 +69,79 @@ describe("streamAntigravity endpoint lifecycle", () => {
     } finally {
       if (previous === undefined) delete process.env.ANTIGRAVITY_BASE_URL;
       else process.env.ANTIGRAVITY_BASE_URL = previous;
+    }
+  });
+
+  it("parses a final SSE data line even when EOF has no trailing newline", async () => {
+    let calls = 0;
+    const payload = {
+      response: {
+        candidates: [
+          {
+            content: { parts: [{ text: "tail-ok" }] },
+            finishReason: "STOP",
+          },
+        ],
+      },
+    };
+    globalThis.fetch = (async () => {
+      calls++;
+      return new Response(`data: ${JSON.stringify(payload)}`, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    }) as typeof fetch;
+
+    try {
+      const events: string[] = [];
+      for await (const event of streamAntigravity(model, context, { apiKey })) {
+        events.push(event.type);
+      }
+      assert.equal(calls, 1);
+      assert.ok(events.includes("text_delta"));
+      assert.ok(events.includes("done"));
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("re-discovers a real project from placeholder credentials", async () => {
+    const previousProject = process.env.ANTIGRAVITY_PROJECT_ID;
+    delete process.env.ANTIGRAVITY_PROJECT_ID;
+    const seenProjects: string[] = [];
+    const placeholderKey = JSON.stringify({
+      token: "stream-placeholder-token",
+      projectId: defaultProjectId(),
+    });
+
+    globalThis.fetch = (async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/v1internal:loadCodeAssist")) {
+        return new Response(
+          JSON.stringify({
+            currentTier: { id: "free-tier" },
+            cloudaicompanionProject: "stream-recovered-project",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (url.includes("/v1internal:streamGenerateContent")) {
+        const body = JSON.parse(String(init?.body ?? "{}")) as { project?: string };
+        if (body.project) seenProjects.push(body.project);
+        return successfulSseResponse();
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    }) as typeof fetch;
+
+    try {
+      for await (const _event of streamAntigravity(model, context, { apiKey: placeholderKey })) {
+        // consume
+      }
+      assert.deepEqual(seenProjects, ["stream-recovered-project"]);
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (previousProject === undefined) delete process.env.ANTIGRAVITY_PROJECT_ID;
+      else process.env.ANTIGRAVITY_PROJECT_ID = previousProject;
     }
   });
 

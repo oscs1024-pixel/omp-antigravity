@@ -12,6 +12,7 @@ import {
   fetchAvailableRuntimeModel,
   formatRequestDiagnostics,
   isRetryableEndpointStatus,
+  isPlaceholderProjectId,
   loadCodeAssist,
   parseApiKey,
   resolveProjectId,
@@ -71,11 +72,14 @@ export function streamAntigravity(
       }
       const creds = parseApiKey(apiKeyRaw);
       setLastAccountId(creds.email);
-      // Skip loadCodeAssist roundtrip when credentials already carry a projectId.
-      const warmedProject = creds.projectId ? null : await loadCodeAssist(creds.token);
+      // A synthetic fallback project is not authoritative. Re-probe it so a
+      // transient login-time discovery failure heals without requiring re-login.
+      const credentialProjectId =
+        creds.projectId && !isPlaceholderProjectId(creds.projectId) ? creds.projectId : undefined;
+      const warmedProject = credentialProjectId ? null : await loadCodeAssist(creds.token);
       const projectId = resolveProjectId({
         warmedProject,
-        credentialProjectId: creds.projectId,
+        credentialProjectId,
       });
       setLastProjectId(projectId);
 

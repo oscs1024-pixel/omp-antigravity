@@ -179,9 +179,13 @@ export async function streamResponse(
 
   while (true) {
     const result = await reader.read();
-    if (result.done) break;
-    if (!(result.value instanceof Uint8Array)) continue;
-    buffer += decoder.decode(result.value, { stream: true });
+    if (result.done) {
+      buffer += decoder.decode();
+      if (buffer && !buffer.endsWith("\n")) buffer += "\n";
+    } else {
+      if (!(result.value instanceof Uint8Array)) continue;
+      buffer += decoder.decode(result.value, { stream: true });
+    }
 
     let newlineIdx: number;
     while ((newlineIdx = buffer.indexOf("\n", scanStart)) !== -1) {
@@ -314,6 +318,7 @@ export async function streamResponse(
       buffer = buffer.slice(scanStart);
       scanStart = 0;
     }
+    if (result.done) break;
   }
 
   flushTextBuffer(true);
