@@ -6,6 +6,13 @@ export type DiagnosticsSnapshot = {
   status?: number;
   endpoint?: string;
   error?: string;
+  /**
+   * Backend body of the last non-2xx response, verbatim (redacted, truncated).
+   * `error` carries the plugin's own wording — which is classification-safe by
+   * design and therefore says nothing about a body the plugin could not
+   * classify — so the raw reason has to survive somewhere for `/antigravity.doctor`.
+   */
+  lastErrorBody?: string;
   projectId?: string;
   accountId?: string;
   resolvedRuntimeModel?: string;
@@ -72,6 +79,10 @@ export function setLastEndpoint(endpoint: string | undefined): void {
 }
 export function setLastError(error: string | undefined): void {
   currentBag().error = error === undefined ? undefined : redactSecrets(error).slice(0, 800);
+}
+/** Record the backend body of a failed response for `/antigravity.doctor`. */
+export function setLastErrorBody(body: string | undefined): void {
+  currentBag().lastErrorBody = body === undefined ? undefined : redactSecrets(body).slice(0, 800);
 }
 export function setLastProjectId(projectId: string | undefined): void {
   currentBag().projectId = projectId;

@@ -211,7 +211,7 @@ sequenceDiagram
 4. **`fetch.ts`（双看门狗）**：响应头默认 180 秒超时，SSE 中途无数据默认 120 秒超时；每收到一个 chunk 会重置 stall timer，正常长响应不会被固定总时长切断。
 5. **`response.ts`（SSE 状态机）**：增量输出 `thinkingDelta`、`textDelta` 与 `toolCall`，解析 usage/finishReason/responseId，并处理 EOF 前没有尾换行的最后一条 `data:`。
 6. **`leak-detector.ts`（规划 JSON 过滤）**：仅缓冲疑似 planning JSON 前缀，识别后抑制泄露的内部规划对象，同时保留其后的普通文本。
-7. **错误与重试**：网络失败、404 与指定 5xx 可切换候选端点；401/403 与真实 quota wall 不跨端点重试。wire 层完全没有非空文本 part 或 function call 时最多进行两次退避重试。
+7. **`errors.ts`（友好错误转换与重试）**：捕获 Google 人机验证（`VALIDATION_REQUIRED`）提取 `validation_url`；规范化分类 404/429/5xx 错误，将 429 细分为瞬时限流、模型容量短窗口与真实配额墙（`isHardQuotaWall` 同步驱动文案与端点重试策略）；网络失败、404 与指定 5xx 可切换候选端点，401/403 与真实 quota wall 不跨端点重试。
 8. **成本归一化**：优先调用 OMP extension loader 暴露的 `calculateCost` 兼容 helper；在普通 Bun/Node 测试环境不存在该 helper 时使用等价的 flat-rate 计算。
 
 ```mermaid
@@ -503,22 +503,27 @@ omp plugin uninstall omp-antigravity
 - 运行 `/login antigravity` 重新登录。
 - 检查 `/antigravity.doctor` 查看最后一次请求对应的 `lastEndpoint` 与 `lastStatus`。
 
-### 3. 报错 429（瞬时限流 vs 真实配额墙）
+### 3. 报错 429（瞬时限流 / 模型容量墙 / 真实配额墙）
 
-插件把 429 分成两类，给出不同文案并交给 OMP 走不同处置路径：
+插件把 429 分成三类，给出不同文案并交给 OMP 走不同处置路径：
 
 - **瞬时限流** —— 后端返回通用 `RESOURCE_EXHAUSTED`（如 `Resource has been exhausted (e.g. check quota).`），且没有 `Resets in …` / `Individual quota reached` / `quota exceeded` 之类的硬信号。
   文案：`Rate limited by Antigravity (HTTP 429)`。OMP 会自行退避重试，**不会**封禁或轮换账号凭据，通常无需人工干预。
-- **真实配额墙** —— 后端给出了重置窗口或明确的配额措辞。
-  文案：`Quota reached. Resets in …`。OMP 会按后端给出的重置窗口封禁该凭据，并尝试轮换到其它账号。
+- **模型容量墙（短窗口）** —— Cloud Code Assist 的模型级措辞 `You have exhausted your capacity on this model. Your quota will reset after 2s.`：重置窗口短到可以自行恢复。
+  文案：`Antigravity has no capacity for this model right now (HTTP 429, clears in 2s)`。仍走瞬时限流通道（可重试、不封禁凭据），并且会继续尝试其余端点 —— 沙箱与生产端点的容量池是独立的，换端点常常立刻成功。
+- **真实配额墙** —— 后端给出了重置窗口或明确的配额措辞，包括模型容量墙中 `… after 4h 30m` 这类多小时窗口。
+  文案：`Quota reached. Resets in …`。OMP 会按后端给出的重置窗口封禁该凭据，并尝试轮换到其它账号。此类错误不会在其余端点上重试（账号级问题，换端点无用）。
+
+重试窗口的阈值取 5 分钟，与 OMP 自身的 `LONG_RATE_LIMIT_DELAY_MS` 对齐：短于 5 分钟的容量窗口按限流处理（不封禁凭据、不浪费一次轮换），长于 5 分钟或未给出窗口的按配额墙处理。
 
 排查建议：
 
 - 运行 `/antigravity.usage` 查看当前账号各配额池消耗情况。
+- 运行 `/antigravity.doctor` 查看 `lastStatus` / `lastError` / `lastErrorBody`：`lastErrorBody` 是后端响应体的原文（已脱敏截断）。插件抛出的文案为了通过 OMP 的错误分类器而刻意不含 `quota` / `exhausted` 等词，因此**后端到底说了什么只能从这个字段看**。
 - 报错为瞬时限流却反复出现时，说明后端在该时段对该账号做了限流，稍后重试即可 —— 此时账号用量显示正常属预期现象，不要误判为配额耗尽。
 - 报错为 `Quota reached` 时，注意 Antigravity 平台中多个同系列模型共享配额池，单纯切换同厂商模型可能仍受同一配额限制。
 
-> ⚠️ **429 文案是承重的，不是装饰。** OMP 用正则对插件抛出的错误消息做分类（`@oh-my-pi/pi-ai/src/error/rate-limit.ts` 的 `USAGE_LIMIT_PATTERN`），其中包含 `/resource.?exhausted/i`。因此把 gRPC 状态名原样写回消息（例如 `ResourceExhausted`）会让 OMP 把**瞬时限流**误判成**账号配额墙**：provider 级重试被禁用，并且会去封禁/轮换凭据 —— 单账号场景下无兄弟账号可换，请求直接失败。同理，配额墙文案必须保留后端原生的 `Resets in …` 语法（OMP 用 `extractProviderRetryHint` 解析它来设定封禁时长，`Please wait …` 不被识别）。改动 `src/stream/errors.ts` 的 429 文案后，请务必运行 `bun scripts/test-model-routing.ts` —— 其中的 modern classifier 交叉校验就是针对这个坑设的。
+> ⚠️ **429 文案是承重的，不是装饰。** OMP 用正则对插件抛出的错误消息做分类（`@oh-my-pi/pi-ai/src/error/rate-limit.ts` 的 `USAGE_LIMIT_PATTERN`），其中包含 `/resource.?exhausted/i` 与 `/exhausted your capacity/`。因此把后端的原话（`ResourceExhausted`、`You have exhausted your capacity on this model`）直接写回消息，会让 OMP 把该错误判成账号配额墙：provider 级重试被禁用，并且会去封禁/轮换凭据 —— 单账号场景下无兄弟账号可换，请求直接失败。同理，配额墙文案必须保留后端原生的 `Resets in …` 语法（OMP 用 `extractProviderRetryHint` 解析它来设定封禁时长，`Please wait …` 不被识别），而瞬时限流文案必须**不**包含该语法（否则一个 2 秒的抖动会换来一次凭据封禁）。改动 `src/stream/errors.ts` 的 429 文案后，请务必运行 `bun scripts/test-model-routing.ts` 与 `bun test test/errors.test.ts` —— 其中的 modern classifier 交叉校验就是针对这个坑设的。
 
 ### 4. 出现两个 Antigravity 登录项
 

@@ -23,6 +23,7 @@ import {
   setLastAccountId,
   setLastEndpoint,
   setLastError,
+  setLastErrorBody,
   setLastLatencyMs,
   setLastProjectId,
   setLastResolvedRuntimeModel,
@@ -32,7 +33,7 @@ import { getFallbackRuntimeModel, hasAntigravityRouting, PROVIDER_ID } from "../
 import { safeError, writePrivateFileNoFollow } from "../utils/security.js";
 import type { AntigravityStreamOptions } from "../types/types.js";
 import { antigravityEnv, recordSessionExecutionId } from "../utils/util.js";
-import { friendlyAntigravityError } from "./errors.js";
+import { friendlyAntigravityError, isHardQuotaWall } from "./errors.js";
 import { fetchWithHeaderDeadline, streamHeaderTimeoutMs, streamStallTimeoutMs } from "./fetch.js";
 import { buildRequest, resolveInitialRuntimeModel, resolveRequestedEffort } from "./request.js";
 import { createOutput, streamResponse } from "./response.js";
@@ -160,17 +161,18 @@ export function streamAntigravity(
               break;
             }
             lastText = await response.text();
+            setLastErrorBody(lastText);
             if (response.status === 401 || response.status === 403) {
               break;
             }
-            if (
-              response.status === 429 &&
-              (/Individual quota reached/i.test(lastText) ||
-                /Resets? in /i.test(lastText) ||
-                (!/rate.?limit/i.test(lastText) &&
-                  /quota exceeded|exceeded your|daily limit/i.test(lastText)))
-            ) {
-              break;
+            if (response.status === 429) {
+              // A quota wall (account weekly/daily, or a per-model capacity window
+              // measured in hours) is account-scoped: no sibling endpoint can serve
+              // it, so failing fast leaves the credential block to OMP. A throttle
+              // is endpoint-scoped — the sandbox and production pools fill
+              // independently — so it keeps walking the candidate chain.
+              if (isHardQuotaWall(lastText)) break;
+              continue;
             }
             // Only retry across endpoints for 404 (model candidate may exist on another endpoint)
             // or transient server errors (500, 502, 503, 504).
@@ -286,6 +288,20 @@ export function streamAntigravity(
       setLastLatencyMs(Date.now() - startTime);
       output.stopReason = opts.signal?.aborted ? "aborted" : "error";
       output.errorMessage = safeError(error);
+      let errStatus: number | undefined;
+      if (error instanceof ProviderHttpError) {
+        errStatus = error.status;
+      } else if (
+        error &&
+        typeof error === "object" &&
+        "status" in error &&
+        typeof error.status === "number"
+      ) {
+        errStatus = error.status;
+      }
+      if (errStatus !== undefined) {
+        output.errorStatus = errStatus;
+      }
       setLastError(output.errorMessage);
       stream.push({ type: "error", reason: output.stopReason, error: output });
       stream.end();

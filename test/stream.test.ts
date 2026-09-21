@@ -7,6 +7,7 @@ import {
   endpointCandidates,
   resetEndpointPreferenceForTests,
 } from "../src/client/client.js";
+import { getLastDiagnostics } from "../src/diagnostics/diagnostics.js";
 import { streamAntigravity } from "../src/stream/stream.js";
 
 const model = {
@@ -279,6 +280,88 @@ describe("streamAntigravity endpoint lifecycle", () => {
       assert.ok(requested[1]!.startsWith(candidates[1]!));
       assert.equal(endpointCandidates()[0], candidates[1]);
       assert.ok(events.includes("done"));
+    } finally {
+      globalThis.fetch = originalFetch;
+      resetEndpointPreferenceForTests();
+    }
+  });
+});
+
+function rateLimitResponse(message: string): Response {
+  return new Response(
+    JSON.stringify({ error: { code: 429, message, status: "RESOURCE_EXHAUSTED" } }),
+    { status: 429, headers: { "Content-Type": "application/json" } },
+  );
+}
+
+async function errorEventOf(
+  stream: AssistantMessageEventStream,
+): Promise<{ message: string; status?: number }> {
+  let message = "";
+  let status: number | undefined;
+  for await (const event of stream) {
+    if (event.type === "error") {
+      message = event.error.errorMessage ?? "";
+      status = event.error.errorStatus;
+    }
+  }
+  // The diagnostics bag is committed when `runWithDiagnostics` unwinds, which
+  // happens a microtask after the stream ends.
+  await immediate();
+  return { message, status };
+}
+
+describe("streamAntigravity 429 handling", () => {
+  const originalFetch = globalThis.fetch;
+
+  it("stops at the first endpoint on a per-model quota wall and reports its window", async () => {
+    resetEndpointPreferenceForTests();
+    const requested: string[] = [];
+    globalThis.fetch = (async (input: string | URL) => {
+      requested.push(String(input));
+      return rateLimitResponse(
+        "You have exhausted your capacity on this model. Your quota will reset after 4h 30m.",
+      );
+    }) as typeof fetch;
+
+    try {
+      const err = await errorEventOf(streamAntigravity(model, context, { apiKey }));
+      assert.match(err.message, /Quota reached\. Resets in 4h 30m/);
+      assert.equal(err.status, 429);
+      assert.equal(requested.length, 1, "an account/model quota wall must not fan out");
+      // The plugin's own wording is classification-safe, so it deliberately says
+      // nothing about a body it could not classify — the raw reason has to reach
+      // /antigravity.doctor instead.
+      const diagnostics = getLastDiagnostics();
+      assert.match(diagnostics.lastErrorBody ?? "", /exhausted your capacity on this model/);
+      assert.equal(diagnostics.status, 429);
+    } finally {
+      globalThis.fetch = originalFetch;
+      resetEndpointPreferenceForTests();
+    }
+  });
+
+  it("walks the endpoint chain when a 429 clears within minutes", async () => {
+    resetEndpointPreferenceForTests();
+    const candidates = endpointCandidates();
+    const requested: string[] = [];
+    globalThis.fetch = (async (input: string | URL) => {
+      requested.push(String(input));
+      return rateLimitResponse(
+        "You have exhausted your capacity on this model. Your quota will reset after 2s.",
+      );
+    }) as typeof fetch;
+
+    try {
+      const err = await errorEventOf(streamAntigravity(model, context, { apiKey }));
+      assert.match(err.message, /no capacity for this model/);
+      assert.equal(err.status, 429);
+      assert.ok(!/Quota reached/.test(err.message), `throttle must stay retryable: ${err.message}`);
+      assert.equal(
+        requested.length,
+        candidates.length,
+        "a throttle is endpoint-scoped and must try the remaining candidates",
+      );
     } finally {
       globalThis.fetch = originalFetch;
       resetEndpointPreferenceForTests();

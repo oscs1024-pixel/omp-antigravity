@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { friendlyAntigravityError, mapStopReason } from "../src/stream/errors.js";
+import {
+  friendlyAntigravityError,
+  isHardQuotaWall,
+  mapStopReason,
+  streamChunkError,
+} from "../src/stream/errors.js";
 import { StopReason } from "../src/types/enums.js";
 
 describe("friendlyAntigravityError", () => {
@@ -20,6 +25,49 @@ describe("friendlyAntigravityError", () => {
     const errorMsg = "Daily limit exceeded for this project.";
     const friendly = friendlyAntigravityError(429, errorMsg);
     assert.ok(friendly.includes("Quota reached."));
+  });
+
+  // Cloud Code Assist's per-model capacity wording reaches the plugin in two
+  // shapes with opposite meanings: "…Your quota will reset after 2s" is a blip
+  // that clears on its own, "…after 4h 30m" is a spent daily quota. Both used to
+  // fall through to the bare "Rate limited by Antigravity (HTTP 429)" text, so
+  // the user saw an unexplained 429 and an "retrying automatically" promise that
+  // could not hold for hours.
+  it("formats a multi-hour per-model capacity window as a quota wall with its window", () => {
+    const errorMsg =
+      '{"error":{"code":429,"message":"You have exhausted your capacity on this model. Your quota will reset after 4h 30m.","status":"RESOURCE_EXHAUSTED"}}';
+    const friendly = friendlyAntigravityError(429, errorMsg);
+    assert.match(friendly, /^Quota reached\./);
+    assert.match(friendly, /Resets in 4h 30m/);
+  });
+
+  it("formats a per-model capacity window of seconds as a retryable throttle", () => {
+    for (const body of [
+      '{"error":{"code":429,"message":"You have exhausted your capacity on this model. Your quota will reset after 2s.","status":"RESOURCE_EXHAUSTED"}}',
+      '{"error":{"message":"You have exhausted your capacity on this model. Your quota will reset after 30s."}}',
+    ]) {
+      const friendly = friendlyAntigravityError(429, body);
+      assert.ok(!/Quota reached/i.test(friendly), `must not read as a quota wall: ${friendly}`);
+      assert.match(friendly, /no capacity for this model/);
+      assert.match(friendly, /429/);
+      assert.match(friendly, /retrying automatically/);
+      assert.ok(!/quota/i.test(friendly), `throttle wording must not mention quota: ${friendly}`);
+      assert.ok(
+        !/exhausted/i.test(friendly),
+        `throttle wording must not echo the backend's exhausted token: ${friendly}`,
+      );
+    }
+  });
+
+  it("keeps a capacity window that clears in seconds out of the quota-wall grammar", () => {
+    // "Resets in …" is the grammar OMP parses into a credential *block*; a
+    // short-window throttle must not be armed with it.
+    const friendly = friendlyAntigravityError(
+      429,
+      '{"error":{"message":"You have exhausted your capacity on this model. Your quota will reset after 2s."}}',
+    );
+    assert.match(friendly, /clears in 2s/);
+    assert.ok(!/resets? in/i.test(friendly), `no block grammar on a throttle: ${friendly}`);
   });
 
   // Regression guard for the 429 transient/hard-limit split.
@@ -108,8 +156,7 @@ describe("mapStopReason", () => {
 });
 
 describe("streamChunkError", () => {
-  it("recovers HTTP status from numeric error.code", async () => {
-    const { streamChunkError } = await import("../src/stream/errors.js");
+  it("recovers HTTP status from numeric error.code", () => {
     const err = streamChunkError({
       code: 429,
       message: "Quota exceeded",
@@ -118,16 +165,61 @@ describe("streamChunkError", () => {
     assert.equal(err.status, 429);
   });
 
-  it("maps Google status string when code is absent", async () => {
-    const { streamChunkError } = await import("../src/stream/errors.js");
+  it("maps Google status string when code is absent", () => {
     const err = streamChunkError({ status: "PERMISSION_DENIED", message: "denied" });
     assert.equal(err.status, 403);
   });
 
-  it("falls back to 500 for unclassified errors", async () => {
-    const { streamChunkError } = await import("../src/stream/errors.js");
+  it("falls back to 500 for unclassified errors", () => {
     const err = streamChunkError({ message: "something broke" });
     assert.equal(err.status, 500);
+  });
+
+  it("formats 429 stream chunks through friendlyAntigravityError", () => {
+    const transientErr = streamChunkError({
+      code: 429,
+      message: "Resource has been exhausted (e.g. check quota).",
+      status: "RESOURCE_EXHAUSTED",
+    });
+    assert.equal(transientErr.status, 429);
+    assert.match(transientErr.message, /Rate limited by Antigravity/);
+    assert.ok(!/resource.?exhausted/i.test(transientErr.message));
+    assert.ok(!/quota/i.test(transientErr.message));
+
+    const capacityBlipErr = streamChunkError({
+      code: 429,
+      message: "You have exhausted your capacity on this model. Your quota will reset after 2s.",
+      status: "RESOURCE_EXHAUSTED",
+    });
+    assert.equal(capacityBlipErr.status, 429);
+    assert.match(capacityBlipErr.message, /no capacity for this model.*clears in 2s/);
+    assert.ok(!/quota/i.test(capacityBlipErr.message));
+
+    const hardWallErr = streamChunkError({
+      code: 429,
+      message: "Individual quota reached. Resets in 2h 45m.",
+      status: "RESOURCE_EXHAUSTED",
+    });
+    assert.equal(hardWallErr.status, 429);
+    assert.match(hardWallErr.message, /^Quota reached\. Resets in 2h 45m/);
+  });
+  it("formats 403 VALIDATION_REQUIRED stream chunks with validation url", () => {
+    const err = streamChunkError({
+      code: 403,
+      status: "PERMISSION_DENIED",
+      message: JSON.stringify({
+        error: {
+          details: [
+            {
+              reason: "VALIDATION_REQUIRED",
+              metadata: { validation_url: "https://accounts.google.com/verify" },
+            },
+          ],
+        },
+      }),
+    });
+    assert.equal(err.status, 403);
+    assert.match(err.message, /https:\/\/accounts\.google\.com\/verify/);
   });
 });
 
@@ -180,10 +272,12 @@ describe("429 wording vs OMP's real error classifier", () => {
     "Resource has been exhausted (e.g. check quota).",
     "Too many requests, slow down.",
     "Rate limit reached, please slow down.",
+    '{"error":{"code":429,"message":"You have exhausted your capacity on this model. Your quota will reset after 2s."}}',
   ];
   const QUOTA_BODIES = [
     '{"error":{"message":"Quota exceeded. Resets in 6 days."}}',
     "You have exceeded your weekly limit.",
+    '{"error":{"code":429,"message":"You have exhausted your capacity on this model. Your quota will reset after 4h 30m."}}',
   ];
 
   it("keeps transient 429 retryable and off the credential-rotation path", async () => {
@@ -228,5 +322,51 @@ describe("429 wording vs OMP's real error classifier", () => {
         `quota wall must rotate: ${body}`,
       );
     }
+  });
+});
+
+/**
+ * The predicate the streaming endpoint loop and the wording share. Its contract
+ * is behavioral: a wall stops the endpoint fan-out and is reported as a quota,
+ * a throttle keeps walking the candidate chain and stays retryable.
+ */
+describe("isHardQuotaWall", () => {
+  it("classifies account quota walls and per-model capacity windows", () => {
+    const walls = [
+      '{"error":{"message":"Individual quota reached. Resets in 2h 45m."}}',
+      '{"error":{"message":"Quota exceeded. Resets in 6 days."}}',
+      "You have exceeded your weekly limit.",
+      '{"error":{"message":"You have exhausted your capacity on this model. Your quota will reset after 4h 30m."}}',
+      '{"error":{"message":"You have exhausted your capacity on this model. Your quota will reset after 1 week."}}',
+      '{"error":{"message":"You have exhausted your capacity on this model."}}',
+    ];
+    for (const body of walls) {
+      assert.equal(isHardQuotaWall(body), true, `expected a quota wall: ${body}`);
+    }
+
+    const throttles = [
+      "Resource has been exhausted (e.g. check quota).",
+      "Too many requests, slow down.",
+      '{"error":{"message":"You have exhausted your capacity on this model. Your quota will reset after 2s."}}',
+      '{"error":{"message":"You have exhausted your capacity on this model. Your quota will reset after 2s, please retry."}}',
+      '{"error":{"message":"You have exhausted your capacity on this model. Your quota will reset after 30s."}}',
+    ];
+    for (const body of throttles) {
+      assert.equal(isHardQuotaWall(body), false, `expected a throttle: ${body}`);
+    }
+  });
+
+  it("honors a 4h30m window as a block-sized retry hint for the host", async () => {
+    const utils = (await import("@oh-my-pi/pi-utils/fetch-retry").catch(() => undefined)) as
+      { extractRetryHint: (headers: undefined, body: string) => number | undefined } | undefined;
+    if (!utils) return;
+    const friendly = friendlyAntigravityError(
+      429,
+      '{"error":{"message":"You have exhausted your capacity on this model. Your quota will reset after 4h 30m."}}',
+    );
+    const hint = utils.extractRetryHint(undefined, friendly);
+    // A multi-hour wall must not collapse into OMP's 60s default block: that is
+    // what let the credential be reselected and hammered mid-wall.
+    assert.ok(hint !== undefined && hint >= 4 * 3_600_000, `unexpected wall hint: ${hint}`);
   });
 });

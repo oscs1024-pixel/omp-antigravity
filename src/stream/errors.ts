@@ -76,7 +76,7 @@ export function friendlyAntigravityError(status: number | undefined, text: strin
     return "Antigravity reported a conflict for this request. Next: retry once or start a new chat session.";
   }
   if (status === 429) {
-    const wait = msg.match(/Resets? in ([^.\n]+)/i)?.[1]?.trim();
+    const wait = quotaResetWindow(msg);
     if (/Individual quota reached/i.test(msg)) {
       return `Quota reached.${wait ? ` Resets in ${wait}.` : ""} Next: switch models or try again after reset.`;
     }
@@ -103,17 +103,21 @@ export function friendlyAntigravityError(status: number | undefined, text: strin
     // Verified against pi-ai 18.2.1: the transient text must avoid
     // "exhausted"/"quota", while "rate limit" plus the bare status code are what
     // make OMP treat it as transient and apply its rate-limit backoff.
-    const hardLimit =
-      Boolean(wait) ||
-      (!/rate.?limit/i.test(msg) &&
-        /quota exceeded|exceeded your|limit reached|reached your|daily limit/i.test(msg));
-    if (hardLimit) {
+    if (isHardQuotaWall(msg)) {
       // Emit the backend's own "Resets in …" phrasing verbatim: OMP parses it
       // (`extractProviderRetryHint` -> `WILL_RESET_IN_PATTERN`) to size the
       // credential block. "Please wait …" is not a grammar OMP recognizes, which
       // silently collapsed a multi-hour quota wall into the 60s default block and
       // let the credential be reselected and hammered.
       return `Quota reached.${wait ? ` Resets in ${wait}.` : ""} Next: switch models or retry later.`;
+    }
+    if (MODEL_CAPACITY_QUOTA_PATTERN.test(msg)) {
+      // A per-model capacity window short enough to clear on its own: stay in the
+      // transient lane so OMP's rate-limit backoff retries it instead of blocking
+      // the credential. The window is reported in prose ("clears in 2s") rather
+      // than as a retry hint, because a hint would be parsed into a *block* or a
+      // backoff sleep — the wrong instrument for a blip.
+      return `Antigravity has no capacity for this model right now (HTTP 429${wait ? `, clears in ${wait}` : ""}). Next: retrying automatically; switching models often clears it immediately.`;
     }
     return "Rate limited by Antigravity (HTTP 429). Next: retrying automatically; if it persists, switch models.";
   }
@@ -129,6 +133,90 @@ export function friendlyAntigravityError(status: number | undefined, text: strin
   }
   if (status === 504) return "Antigravity timed out upstream. Next: retry in a moment.";
   return msg;
+}
+
+/**
+ * Cloud Code Assist's per-model capacity wording: "You have exhausted your
+ * capacity on this model. Your quota will reset after 2s" (a blip) or "…after
+ * 4h 30m" (a spent daily quota). `@oh-my-pi/pi-ai`'s `parseRateLimitReason`
+ * recognizes the same wording and maps it to `QUOTA_EXHAUSTED`.
+ */
+const MODEL_CAPACITY_QUOTA_PATTERN =
+  /exhausted your capacity on this model|quota will reset (?:after|in)\b/i;
+
+/**
+ * Capacity windows below this are treated as throttles rather than quota walls.
+ * Mirrors the host's own threshold (`LONG_RATE_LIMIT_DELAY_MS` in
+ * `@oh-my-pi/pi-ai/src/error/rate-limit.ts`, 5 minutes) for "a window this short
+ * is not worth burning a credential over".
+ */
+const SHORT_QUOTA_WINDOW_MS = 5 * 60 * 1000;
+
+/**
+ * Reset window a 429 body states, in the backend's own words. Two grammars
+ * reach us: "Resets in 2h 45m" (account quota) and "Your quota will reset after
+ * 4h 30m" (per-model capacity).
+ */
+function quotaResetWindow(text: string): string | undefined {
+  const match =
+    /Resets? in ([^.,"\n]+)/i.exec(text) ?? /quota will reset (?:after|in) ([^.,"\n]+)/i.exec(text);
+  return match?.[1]?.trim() || undefined;
+}
+
+/** Duration units a reset window may carry. "ms" is listed before "m"/"s". */
+const WINDOW_COMPONENT_PATTERN =
+  /(\d+(?:\.\d+)?)\s*(ms|milliseconds?|s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?|d|days?|w|weeks?)/gi;
+
+/** Milliseconds per unit word, keyed on its prefix so "ms" cannot read as "m". */
+function windowUnitMs(unit: string): number | undefined {
+  const key = unit.toLowerCase();
+  if (key.startsWith("ms") || key.startsWith("millisecond")) return 1;
+  if (key.startsWith("s")) return 1000;
+  if (key.startsWith("m")) return 60_000;
+  if (key.startsWith("h")) return 3_600_000;
+  if (key.startsWith("d")) return 86_400_000;
+  if (key.startsWith("w")) return 7 * 86_400_000;
+  return undefined;
+}
+
+/** Sum every "<number><unit>" component of a window; undefined when none parse. */
+function parseWindowMs(window: string): number | undefined {
+  let total = 0;
+  let matched = false;
+  for (const [, amount, unit] of window.matchAll(WINDOW_COMPONENT_PATTERN)) {
+    const factor = windowUnitMs(unit);
+    if (factor === undefined) continue;
+    total += Number(amount) * factor;
+    matched = true;
+  }
+  return matched ? total : undefined;
+}
+
+/**
+ * Whether a 429 body is an account- or model-scoped quota wall rather than a
+ * transient throttle.
+ *
+ * Exported because the streaming endpoint loop and {@link friendlyAntigravityError}
+ * must agree: the loop decides whether to fan out across endpoints, the wording
+ * decides how the host classifies the failure. They were separate copies of the
+ * same regexes, and their drift is what produced a "persistent 429" incident —
+ * one copy retried an endpoint the other had already given up on.
+ */
+export function isHardQuotaWall(text: string): boolean {
+  const window = quotaResetWindow(text);
+  if (MODEL_CAPACITY_QUOTA_PATTERN.test(text)) {
+    // A window the backend expects to clear within minutes is a throttle; an
+    // unstated or longer one is a wall. Deliberately narrower than the host's
+    // text mapping, which treats every capacity message as a quota: blocking a
+    // credential for a two-second blip fails turns that would have retried clean.
+    const windowMs = window === undefined ? undefined : parseWindowMs(window);
+    return windowMs === undefined || windowMs >= SHORT_QUOTA_WINDOW_MS;
+  }
+  return (
+    window !== undefined ||
+    (!/rate.?limit/i.test(text) &&
+      /quota exceeded|exceeded your|limit reached|reached your|daily limit/i.test(text))
+  );
 }
 
 /** Google wire `status` strings mapped to their HTTP status code. */
@@ -161,12 +249,17 @@ export function streamChunkError(error: {
   code?: number;
   status?: string;
 }): ProviderHttpError {
-  const message = redactSecrets(error.message || JSON.stringify(error)).slice(0, 500);
+  const raw = error.message || JSON.stringify(error);
   const status =
     (typeof error.code === "number" && error.code >= 400 && error.code < 600 && error.code) ||
     (error.status ? GOOGLE_STATUS_TO_HTTP[error.status] : undefined) ||
     500;
-  return new ProviderHttpError(`Antigravity stream error: ${message}`, status, {
+  const friendly = friendlyAntigravityError(status, raw);
+  const message =
+    status === 429 && /Quota reached\./i.test(friendly)
+      ? friendly
+      : `Antigravity stream error: ${friendly}`;
+  return new ProviderHttpError(message, status, {
     code: error.status,
   });
 }

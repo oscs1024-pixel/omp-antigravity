@@ -507,6 +507,7 @@ export default function (pi: ExtensionAPI): void {
         ...(d.latencyMs !== undefined ? [`lastLatencyMs=${d.latencyMs}`] : []),
         `toolSchemaWarnings=${d.toolSchemaWarnings || "none"}`,
         `lastError=${d.error ? redactSecrets(d.error) : "none"}`,
+        `lastErrorBody=${d.lastErrorBody ? redactSecrets(d.lastErrorBody) : "none"}`,
         "transport=native-streamSimple",
         "runtimeCli=not-used",
         "commands=/antigravity.accounts /antigravity.usage /antigravity.models /antigravity.refresh /antigravity.doctor /antigravity.image",
