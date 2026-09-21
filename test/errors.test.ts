@@ -10,6 +10,10 @@ describe("friendlyAntigravityError", () => {
     const friendly = friendlyAntigravityError(429, errorMsg);
     assert.ok(friendly.includes("Quota reached."));
     assert.ok(friendly.includes("2h 45m"));
+    // The reset window must stay in the backend's own "Resets in …" grammar:
+    // OMP parses that phrasing (`extractProviderRetryHint`) to size the
+    // credential block, and ignores "Please wait …".
+    assert.match(friendly, /Resets in 2h 45m/);
   });
 
   it("formats 429 generic quota exceeded as hard limit", () => {
@@ -18,10 +22,41 @@ describe("friendlyAntigravityError", () => {
     assert.ok(friendly.includes("Quota reached."));
   });
 
+  // Regression guard for the 429 transient/hard-limit split.
+  //
+  // OMP classifies the thrown ProviderHttpError by regex over its message
+  // (`@oh-my-pi/pi-ai/src/error/rate-limit.ts`). `USAGE_LIMIT_PATTERN` matches
+  // `/resource.?exhausted/i` and `quota`, so echoing the gRPC status name back
+  // as the token "ResourceExhausted" makes OMP stamp `Flag.UsageLimit` on a
+  // transient throttle. That disables the provider retry
+  // (`isProviderRetryableError` bails on `isUsageLimit`) and routes the error to
+  // credential rotation (`isUsageLimitOutcome`), which has no sibling to switch
+  // to on a single-account setup. The transient wording must therefore stay free
+  // of quota/exhausted tokens while keeping "rate limit" and the status code.
   it("formats 429 transient rate limit so retry backoff can engage", () => {
     const errorMsg = "Resource has been exhausted (e.g. check quota).";
     const friendly = friendlyAntigravityError(429, errorMsg);
-    assert.ok(friendly.includes("Rate limited by Antigravity (429 ResourceExhausted)"));
+    assert.match(friendly, /Rate limited by Antigravity/);
+    assert.match(friendly, /429/);
+    assert.ok(
+      !/resource.?exhausted/i.test(friendly),
+      `transient 429 must not echo a resource-exhausted token: ${friendly}`,
+    );
+    assert.ok(!/quota/i.test(friendly), `transient 429 must not mention quota: ${friendly}`);
+    assert.ok(!/Quota reached/i.test(friendly), "transient 429 must not read as a quota wall");
+  });
+
+  it("keeps transient 429 wording free of quota tokens across throttle bodies", () => {
+    for (const body of [
+      "Too many requests, slow down.",
+      "Rate limit reached, please slow down.",
+      '{"error":{"code":429,"message":"Resource has been exhausted (e.g. check quota).","status":"RESOURCE_EXHAUSTED"}}',
+    ]) {
+      const friendly = friendlyAntigravityError(429, body);
+      assert.match(friendly, /Rate limited by Antigravity/);
+      assert.ok(!/resource.?exhausted/i.test(friendly), `unexpected exhausted token for: ${body}`);
+      assert.ok(!/quota/i.test(friendly), `unexpected quota token for: ${body}`);
+    }
   });
 
   it("extracts verification url on 403 VALIDATION_REQUIRED", () => {
@@ -93,5 +128,105 @@ describe("streamChunkError", () => {
     const { streamChunkError } = await import("../src/stream/errors.js");
     const err = streamChunkError({ message: "something broke" });
     assert.equal(err.status, 500);
+  });
+});
+
+/**
+ * Cross-check the 429 wording against the classifier OMP 18.x actually drives
+ * retry and credential rotation with.
+ *
+ * The previous guard only exercised the legacy `isRetryableAssistantError` shim
+ * (`@oh-my-pi/pi-coding-agent/src/extensibility/legacy-pi-ai-shim.ts`), which
+ * reads "ResourceExhausted" as retryable. The live path —
+ * `isProviderRetryableError` -> `isUsageLimit` -> `isUsageLimitOutcome` — reads
+ * the same token as an account quota wall, so a transient throttle was silently
+ * routed into credential rotation while the suite stayed green. Asserting the
+ * real classifier is what closes that gap.
+ */
+describe("429 wording vs OMP's real error classifier", () => {
+  type ModernClassifier = {
+    isUsageLimit: (error: unknown) => boolean;
+    isUsageLimitOutcome: (status: number | undefined, message: string | undefined) => boolean;
+    isProviderRetryableError: (error: unknown) => boolean;
+    ProviderHttpError: new (message: string, status: number) => Error;
+  };
+
+  async function resolveClassifier(): Promise<ModernClassifier | undefined> {
+    try {
+      const mod = (await import("@oh-my-pi/pi-ai/error")) as Record<string, unknown>;
+      if (
+        typeof mod.isProviderRetryableError !== "function" ||
+        typeof mod.isUsageLimit !== "function" ||
+        typeof mod.isUsageLimitOutcome !== "function" ||
+        typeof mod.ProviderHttpError !== "function"
+      ) {
+        return undefined;
+      }
+      return mod as unknown as ModernClassifier;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Mirrors the throw shape in `src/stream/stream.ts`. */
+  function asThrown(c: ModernClassifier, friendly: string, status: number): Error {
+    const message = /^Quota reached\./.test(friendly)
+      ? friendly
+      : `Antigravity API error (${status}, endpoint=https://daily-cloudcode-pa.googleapis.com, project=aicode-consumers, runtimeModel=gemini-3.8-flash-high, matched=none, available=unknown): ${friendly}`;
+    return new c.ProviderHttpError(message, status);
+  }
+
+  const TRANSIENT_BODIES = [
+    "Resource has been exhausted (e.g. check quota).",
+    "Too many requests, slow down.",
+    "Rate limit reached, please slow down.",
+  ];
+  const QUOTA_BODIES = [
+    '{"error":{"message":"Quota exceeded. Resets in 6 days."}}',
+    "You have exceeded your weekly limit.",
+  ];
+
+  it("keeps transient 429 retryable and off the credential-rotation path", async () => {
+    const c = await resolveClassifier();
+    assert.ok(
+      c,
+      "expected @oh-my-pi/pi-ai/error to export isProviderRetryableError/isUsageLimit/isUsageLimitOutcome; re-verify the 429 wording contract if these moved",
+    );
+    for (const body of TRANSIENT_BODIES) {
+      const error = asThrown(c, friendlyAntigravityError(429, body), 429);
+      assert.equal(
+        c.isUsageLimit(error),
+        false,
+        `transient 429 must not classify as a usage limit: ${body}`,
+      );
+      assert.equal(
+        c.isProviderRetryableError(error),
+        true,
+        `transient 429 must stay provider-retryable: ${body}`,
+      );
+      assert.equal(
+        c.isUsageLimitOutcome(429, error.message),
+        false,
+        `transient 429 must not rotate: ${body}`,
+      );
+    }
+  });
+
+  it("keeps real quota walls classified as usage limits so OMP rotates", async () => {
+    const c = await resolveClassifier();
+    assert.ok(c, "expected @oh-my-pi/pi-ai/error to export the modern error classifier");
+    for (const body of QUOTA_BODIES) {
+      const error = asThrown(c, friendlyAntigravityError(429, body), 429);
+      assert.equal(
+        c.isUsageLimit(error),
+        true,
+        `quota wall must classify as a usage limit: ${body}`,
+      );
+      assert.equal(
+        c.isUsageLimitOutcome(429, error.message),
+        true,
+        `quota wall must rotate: ${body}`,
+      );
+    }
   });
 });

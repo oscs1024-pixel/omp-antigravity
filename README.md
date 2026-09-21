@@ -503,10 +503,22 @@ omp plugin uninstall omp-antigravity
 - 运行 `/login antigravity` 重新登录。
 - 检查 `/antigravity.doctor` 查看最后一次请求对应的 `lastEndpoint` 与 `lastStatus`。
 
-### 3. 报错 429 (Quota reached / Resource exhausted)
+### 3. 报错 429（瞬时限流 vs 真实配额墙）
+
+插件把 429 分成两类，给出不同文案并交给 OMP 走不同处置路径：
+
+- **瞬时限流** —— 后端返回通用 `RESOURCE_EXHAUSTED`（如 `Resource has been exhausted (e.g. check quota).`），且没有 `Resets in …` / `Individual quota reached` / `quota exceeded` 之类的硬信号。
+  文案：`Rate limited by Antigravity (HTTP 429)`。OMP 会自行退避重试，**不会**封禁或轮换账号凭据，通常无需人工干预。
+- **真实配额墙** —— 后端给出了重置窗口或明确的配额措辞。
+  文案：`Quota reached. Resets in …`。OMP 会按后端给出的重置窗口封禁该凭据，并尝试轮换到其它账号。
+
+排查建议：
 
 - 运行 `/antigravity.usage` 查看当前账号各配额池消耗情况。
-- 注意：Antigravity 平台中多个同系列模型共享配额池，单纯切换同厂商模型可能仍受同一配额限制。
+- 报错为瞬时限流却反复出现时，说明后端在该时段对该账号做了限流，稍后重试即可 —— 此时账号用量显示正常属预期现象，不要误判为配额耗尽。
+- 报错为 `Quota reached` 时，注意 Antigravity 平台中多个同系列模型共享配额池，单纯切换同厂商模型可能仍受同一配额限制。
+
+> ⚠️ **429 文案是承重的，不是装饰。** OMP 用正则对插件抛出的错误消息做分类（`@oh-my-pi/pi-ai/src/error/rate-limit.ts` 的 `USAGE_LIMIT_PATTERN`），其中包含 `/resource.?exhausted/i`。因此把 gRPC 状态名原样写回消息（例如 `ResourceExhausted`）会让 OMP 把**瞬时限流**误判成**账号配额墙**：provider 级重试被禁用，并且会去封禁/轮换凭据 —— 单账号场景下无兄弟账号可换，请求直接失败。同理，配额墙文案必须保留后端原生的 `Resets in …` 语法（OMP 用 `extractProviderRetryHint` 解析它来设定封禁时长，`Please wait …` 不被识别）。改动 `src/stream/errors.ts` 的 429 文案后，请务必运行 `bun scripts/test-model-routing.ts` —— 其中的 modern classifier 交叉校验就是针对这个坑设的。
 
 ### 4. 出现两个 Antigravity 登录项
 

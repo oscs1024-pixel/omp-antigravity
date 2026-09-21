@@ -78,7 +78,7 @@ export function friendlyAntigravityError(status: number | undefined, text: strin
   if (status === 429) {
     const wait = msg.match(/Resets? in ([^.\n]+)/i)?.[1]?.trim();
     if (/Individual quota reached/i.test(msg)) {
-      return `Quota reached. Please wait ${wait || "for reset"}. Next: switch models or try again after reset.`;
+      return `Quota reached.${wait ? ` Resets in ${wait}.` : ""} Next: switch models or try again after reset.`;
     }
     // Google answers a real quota wall with a "Resets in …" hint, but uses generic
     // RESOURCE_EXHAUSTED ("Resource has been exhausted (e.g. check quota).") for
@@ -86,14 +86,36 @@ export function friendlyAntigravityError(status: number | undefined, text: strin
     // alone wrongly marked transient throttling as a hard quota wall, disabling
     // OMP's automatic retry backoff. Keep real quota walls non-retryable, and
     // format transient throttling so OMP's retry mechanism engages.
+    //
+    // This wording is load-bearing, not cosmetic. OMP classifies the thrown
+    // ProviderHttpError by running regexes over its message
+    // (`@oh-my-pi/pi-ai/src/error/rate-limit.ts`), and `USAGE_LIMIT_PATTERN`
+    // contains `/resource.?exhausted/i`. Spelling the gRPC status out as the
+    // single token "ResourceExhausted" therefore stamps `Flag.UsageLimit` on a
+    // transient throttle, and OMP then:
+    //   1. refuses the provider-level retry — `isProviderRetryableError` returns
+    //      false the moment `isUsageLimit(error)` is true; and
+    //   2. reads it as an account quota wall — `isUsageLimitOutcome` drives
+    //      `rotateSessionCredential` -> `markUsageLimitReached`, which blocks the
+    //      credential and rotates to a sibling instead of backing off. With one
+    //      logged-in account there is no sibling, the turn dies, and the 60s block
+    //      keeps subsequent attempts failing too.
+    // Verified against pi-ai 18.2.1: the transient text must avoid
+    // "exhausted"/"quota", while "rate limit" plus the bare status code are what
+    // make OMP treat it as transient and apply its rate-limit backoff.
     const hardLimit =
       Boolean(wait) ||
       (!/rate.?limit/i.test(msg) &&
         /quota exceeded|exceeded your|limit reached|reached your|daily limit/i.test(msg));
     if (hardLimit) {
-      return `Quota reached.${wait ? ` Please wait ${wait}.` : ""} Next: switch models or retry later.`;
+      // Emit the backend's own "Resets in …" phrasing verbatim: OMP parses it
+      // (`extractProviderRetryHint` -> `WILL_RESET_IN_PATTERN`) to size the
+      // credential block. "Please wait …" is not a grammar OMP recognizes, which
+      // silently collapsed a multi-hour quota wall into the 60s default block and
+      // let the credential be reselected and hammered.
+      return `Quota reached.${wait ? ` Resets in ${wait}.` : ""} Next: switch models or retry later.`;
     }
-    return "Rate limited by Antigravity (429 ResourceExhausted). Next: retrying automatically; if it persists, switch models.";
+    return "Rate limited by Antigravity (HTTP 429). Next: retrying automatically; if it persists, switch models.";
   }
   if (status === 500) {
     return "Antigravity had an internal server error. Next: retry in a moment or switch models.";
